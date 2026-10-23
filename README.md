@@ -1,136 +1,134 @@
 # Codex Proxy RS 热补丁（luck7x）
 
-本分支只保存热补丁、构建工作流和部署脚本，不包含上游源码。
-构建时由 GitHub Actions 拉取上游 [zyycn/codex-proxy-rs](https://github.com/zyycn/codex-proxy-rs) 的指定 tag，按文件名顺序应用 `patches/` 下的补丁，检查后编译 Linux amd64 发行包。
-编译只在 GitHub Actions 上进行，服务器只负责下载、校验和切换版本
+本分支只保存热补丁、构建工作流和部署脚本，不包含上游源码。构建时由 GitHub Actions 拉取上游
+[zyycn/codex-proxy-rs](https://github.com/zyycn/codex-proxy-rs) 的指定版本，按顺序打上 `patches/`
+下的补丁，检查通过后编译 Linux amd64 发行包。所有编译都在 GitHub 上完成，服务器只负责下载和部署。
 
-[当前补丁](#当前补丁) · [构建](#构建) · [部署](#部署) · [同步上游新版本](#同步上游新版本) · [补丁冲突](#补丁冲突) · [新增补丁](#新增补丁) · [回退](#回退) · [注意事项](#注意事项)
-
-## 目录
-
-| 路径 | 作用 |
-| --- | --- |
-| `patches/BASE` | 补丁最后一次适配的上游 tag，同时作为 3-way 合并的基线 |
-| `patches/*.patch` | 热补丁，按文件名顺序应用 |
-| `scripts/prepare-source.sh` | 拉取上游 tag 并应用全部补丁，CI 与本地适配共用；只用 git，不编译 |
-| `scripts/deploy-native.sh` | 在服务器上下载 CI 产物、校验并切换版本 |
-| `.github/workflows/native-build.yml` | 唯一启用的工作流，只能手动运行 |
+- 工作流只能手动运行，没有任何自动触发
+- 上游原有的 CI、Security Scan 等工作流已在本仓库停用
+- 产物版本号为 `<上游版本>+luck7x.<构建序号>`，例如 `3.29.7+luck7x.1`
 
 ## 当前补丁
 
-### 0001-openai-account-warmup-schedule
+| 文件 | 作用 |
+| --- | --- |
+| `0001-openai-account-warmup-schedule.patch` | 账号预激活按账号单独定时；修正把未开始的 5h 窗口当成活跃窗口而跳过的问题 |
 
-账号预激活按账号单独定时，并修正空闲账号被误判为窗口计时中的问题
+`patches/BASE` 记录补丁当前基于的上游版本，补丁冲突时用于 3-way 合并。
 
-- 账号备注写 `预激活=07:30` 或 `预激活=07:30,12:30`，该账号只在这些本地时刻预激活；也可以写 `warmup=07:30`
-- 备注写 `预激活=关闭`（或 `warmup=off`）时该账号不参与预激活
-- 备注没有标记的账号跟随「设置 → 账号预激活」的全局时间，按原来的方式批量执行；标记格式错误时同样跟随全局时间并在日志告警
-- 时间格式与全局设置一致：`HH:MM`，多个时间用逗号分隔，允许中文逗号和空格；标记前后可以有其他备注，用分号或换行隔开
-- 总开关和预激活模型仍在设置页统一配置
-- 上游对尚未开始计时的 5h 窗口返回「0 用量、重置时间 = 观测时刻 + 5h」的占位；原逻辑把它当成计时中的窗口而跳过，补丁后照常预激活。刚开始且用量仍显示 0 的窗口也会被这样识别，最多多发一次预激活请求，不会重新开始计时
+### 账号预激活用法
 
-预激活日志在 `runtime/logs/codex-proxy-rs-application.*.log`，按 `OpenAI account warmup` 搜索；`cycle started` 中的 `accounts` 是本轮到点的账号数，`global_due` 表示是否命中全局时间
+总开关和预激活模型仍在管理端「设置 → 账号预激活」。每个账号的时间写在账号备注里：
+
+| 备注写法 | 效果 |
+| --- | --- |
+| `预激活=07:30` | 只在每天 07:30 预激活该账号 |
+| `预激活=07:30,07:35` | 多个时间用逗号分隔；后一个可作为失败补发，成功时只多发一次小请求，不会重启窗口 |
+| `预激活=关闭` | 该账号不参与预激活 |
+| 不写 | 跟随设置页的全局时间，一起批量预激活 |
+
+- 标记可以和其他备注写在一起，例如 `主力号 预激活=07:30；其他说明`，时间之后用分号、换行或文字隔开
+- 也可以写成 `warmup=07:30`、`warmup=off`，中文逗号和等号也能识别
+- 格式写错时该账号按全局时间执行，并在日志里告警
+- 时间按部署时区（`host.timezone`）计算
+- 仍会跳过周额度已用完的账号，以及 5h 窗口正在计时且距重置超过 30 分钟的账号
+
+上游对还没开始的 5h 窗口会返回「用量 0、重置时间 = 观测时刻 + 5 小时」的占位数据，原版会把它当作正在计时而跳过。
+补丁识别这种占位（与观测时刻的偏差在 2 分钟内），照常预激活。
 
 ## 构建
 
-在 GitHub 的 **Actions → Native Build → Run workflow** 填写：
+GitHub 仓库页 → Actions → Native Build → Run workflow：
 
-- `upstream_tag`：上游 tag，例如 `v3.29.7`
-- `build`：同一上游版本的补丁构建序号，从 `1` 开始；补丁内容变化后重新构建同一上游版本时递增
+- `upstream_tag`：上游版本 tag，例如 `v3.29.7`
+- `build`：同一上游版本第几次构建，从 `1` 开始；补丁有修改需要重新构建时加 1
 
-产物版本为 `<版本>+luck7x.<序号>`，例如 `3.29.7+luck7x.1`；`+` 后的构建元数据不参与版本比较
-
-命令行等价操作：
+也可以用命令行触发：
 
 ```bash
 gh workflow run native-build.yml -R luck7x/codex-proxy-rs -f upstream_tag=v3.29.7 -f build=1
-gh run watch -R luck7x/codex-proxy-rs "$(gh run list -R luck7x/codex-proxy-rs -w native-build.yml -L 1 --json databaseId -q '.[0].databaseId')"
+gh run list -R luck7x/codex-proxy-rs --workflow native-build.yml --limit 3
 ```
 
-工作流各任务：
+工作流步骤：
 
-| 任务 | 内容 |
-| --- | --- |
-| `prepare` | 校验输入、应用补丁、读取该上游版本声明的 Rust 与 Node 工具链，上传打好补丁的源码 |
-| `checks` | `cargo fmt --check`、`provider-openai` 的 clippy（`-D warnings`）与额度相关测试 |
-| `frontend` / `backend` | 编译管理端前端与后端程序，后端使用上游 Dockerfile 声明的 Rust 镜像 |
-| `package` | 以上全部通过后打包 `codex-proxy-rs_<版本>_linux_amd64.tar.gz` 与 `checksums.txt` |
-
-发行包保留 30 天，名称为 `codex-proxy-rs-native-<版本>`
+1. `prepare`：校验输入，拉取上游 tag 并应用补丁，从上游的 `rust-toolchain.toml` 和 `deploy/Dockerfile` 读取工具链版本
+2. `checks`：`cargo fmt --check`、`provider-openai` 的 clippy 和额度相关测试
+3. `frontend`、`backend`：编译管理端前端和后端程序，后端使用与上游发行相同的 Rust 镜像
+4. `package`：检查通过后打包为 `codex-proxy-rs-native-<版本>` 产物，保留 30 天
 
 ## 部署
 
-服务器需要已登录的 `gh`，以 root 运行：
+在服务器上执行（需要 root 和已登录的 `gh`）：
 
 ```bash
-git clone -b hotpatch https://github.com/luck7x/codex-proxy-rs.git codex-proxy-rs-hotpatch
-sudo codex-proxy-rs-hotpatch/scripts/deploy-native.sh <run ID> 3.29.7+luck7x.1
+sudo scripts/deploy-native.sh <Actions run ID> <版本号>
+# 例如
+sudo scripts/deploy-native.sh 39935862450 3.29.7+luck7x.1
 ```
 
-脚本依次完成：
+脚本会：
 
-1. 下载该次运行的发行包，按 `checksums.txt` 校验 SHA-256，并确认程序报告的版本与参数一致
-2. 解压到新目录 `/opt/codex-proxy-rs-native-<版本>`：程序、前端和配套的官方插件清单来自同一次构建，`deploy/config.yaml` 复制自当前版本，`.runtime` 指向共享运行目录
-3. 原子切换 `/opt/codex-proxy-rs-native/current`，重启 `codex-proxy-rs` 服务，等待 `/healthz` 返回 204；端口从 systemd 单元的 `CPR_SERVER_PORT` 读取
+1. 下载产物并核对 SHA-256 和程序版本号
+2. 安装到新目录 `/opt/codex-proxy-rs-native-<版本号>`，沿用当前版本的 `deploy/config.yaml` 和运行数据
+3. 把 `/opt/codex-proxy-rs-native/current` 切换到新目录并重启服务，等待 `/healthz` 返回 204
 
-目录、服务名、运行用户和仓库可用 `CPR_BASE`、`CPR_SERVICE`、`CPR_OWNER`、`CPR_REPO` 覆盖
-
-## 同步上游新版本
-
-1. 查看上游最新版本与发布说明，重点看数据库迁移和不兼容变更：`gh release view -R zyycn/codex-proxy-rs`
-2. 按发布说明先备份数据库与配置；新版本的迁移在服务启动时自动执行，迁移后回退旧版本需要恢复备份
-3. 运行 Native Build，`upstream_tag` 填新 tag、`build` 填 `1`
-4. `prepare` 通过说明补丁能直接打上；全部任务通过后按[部署](#部署)切换
-5. 确认新版本运行正常后，把 `patches/BASE` 改成新 tag 并提交，让后续 3-way 合并以新版本为基线
-
-`prepare` 失败表示补丁冲突，按下一节处理；`checks` 或 `backend` 失败表示补丁能打上但与新版本代码不兼容，同样需要按下一节修改补丁
-
-## 补丁冲突
-
-本地只做 git 操作和代码编辑，编译与测试交给 CI：
+旧版本目录保留不删，上一版本路径记在 `/opt/codex-proxy-rs-native/previous-current.txt`。回退：
 
 ```bash
-git clone -b hotpatch https://github.com/luck7x/codex-proxy-rs.git codex-proxy-rs-hotpatch
-cd codex-proxy-rs-hotpatch
-scripts/prepare-source.sh v3.30.0 /tmp/cpr-v3.30.0     # 冲突时会列出未合并的文件
-cd /tmp/cpr-v3.30.0
-git status --short                                     # 解决冲突标记，保持补丁原有行为
-git add -A
-git diff --cached --full-index -- backend frontend > ~/codex-proxy-rs-hotpatch/patches/0001-openai-account-warmup-schedule.patch
-```
-
-保留补丁文件开头的说明段落（在第一行 `diff --git` 之前，应用时会被忽略），把其中的 `Base:` 改为新 tag，`patches/BASE` 同步修改，提交推送后重新运行 Native Build 验证
-
-补丁改动的上游位置：
-
-- `backend/crates/providers/openai/src/credential/quota/warmup.rs`：备注解析、到点账号选择、窗口占位识别
-- `backend/crates/providers/openai/src/provider/workers.rs`：预激活定时任务按账号选择后领取执行时刻
-- `backend/crates/providers/openai/tests/`：对应测试与内存仓库的备注辅助方法
-
-上游如果自带了等价功能，删除对应补丁文件即可
-
-## 新增补丁
-
-1. 用 `scripts/prepare-source.sh <tag> <目录>` 得到已打好现有补丁的源码并提交为一个基线提交
-2. 在其上修改，遵守上游 `AGENTS.md` 的约定（中文注释、测试随功能维护）
-3. 用 `git diff --full-index <基线提交> -- backend frontend > patches/000N-<名称>.patch` 生成新补丁，文件名序号决定应用顺序
-4. 改动涉及 `provider-openai` 以外的 crate 时，同步扩展工作流 `checks` 任务的 clippy 与测试范围
-5. 在本文件「当前补丁」中说明新补丁的行为与配置方式
-
-## 回退
-
-旧版本目录在部署后保留，切回即可：
-
-```bash
-sudo ln -sfn /opt/codex-proxy-rs-native-<旧版本> /opt/codex-proxy-rs-native/current
+sudo ln -sfn "$(cat /opt/codex-proxy-rs-native/previous-current.txt)" /opt/codex-proxy-rs-native/current
 sudo systemctl restart codex-proxy-rs
 ```
 
-跨越数据库迁移的回退需要先恢复升级前的数据库备份
+路径和服务名可用环境变量覆盖：`CPR_BASE`、`CPR_SERVICE`、`CPR_OWNER`、`CPR_REPO`。健康检查端口从 systemd 服务的
+`CPR_SERVER_PORT` 读取。
 
-## 注意事项
+## 同步上游新版本
 
-- 不要使用管理端的「在线更新」：它会换成官方构建，热补丁随之丢失；升级一律走本仓库的构建与部署
-- 发行包内的官方插件清单由工作流生成，插件列表为空，版本与 git sha 和程序一致；当前部署未安装插件，需要官方插件时另行评估
-- 本仓库只启用 Native Build；从上游继承的 CI、Security Scan、Agent Instructions Guard、Release 已在仓库设置中停用，不会因推送、PR 或定时任务自动运行
-- 分支 `luck7x/v3.29.7-account-warmup` 保存补丁在 v3.29.7 上的完整源码，仅供对照
+1. 查看上游最新版本和发布说明，留意数据库迁移、配置字段和插件协议的变化：
+
+   ```bash
+   gh release view -R zyycn/codex-proxy-rs
+   ```
+
+2. 用新 tag 运行 Native Build，`build` 填 `1`
+3. 补丁能干净打上且检查通过，就得到新版本发行包；升级前按上游说明备份数据库，再用部署脚本部署。新版本自带的数据库迁移会在启动时自动执行
+4. 部署成功后把 `patches/BASE` 改成新 tag 并提交，作为以后 3-way 合并的基线
+
+不要在管理端使用「在线更新」：它会换成官方构建，热补丁随之失效。
+
+### 补丁冲突
+
+`prepare` 步骤报「补丁无法应用」时，说明上游改动了补丁涉及的代码，需要手动适配。适配只用 git，不需要在本地编译：
+
+```bash
+git clone https://github.com/zyycn/codex-proxy-rs.git cpr-upstream && cd cpr-upstream
+git checkout -b adapt <新 tag>
+git apply --3way /path/to/hotpatch/patches/0001-openai-account-warmup-schedule.patch
+# 按冲突标记修改文件，完成后
+git add -A
+git diff --cached --full-index <新 tag> -- backend > /path/to/hotpatch/patches/0001-openai-account-warmup-schedule.patch
+```
+
+把补丁文件开头的说明行补回去（`git apply` 会忽略第一个 `diff --git` 之前的文字），提交到本分支，再运行 Native Build。
+编译和测试是否通过以 Actions 结果为准。
+
+## 新增补丁
+
+1. 从上游 tag 拉分支修改代码，提交后生成补丁：
+
+   ```bash
+   git diff --full-index <tag> HEAD -- backend frontend > patches/0002-<简短说明>.patch
+   ```
+
+2. 补丁按文件名顺序应用，编号接在已有补丁之后
+3. 补丁改动 `provider-openai` 以外的 crate 时，在工作流 `checks` 中补上对应的 clippy 和测试
+4. 补丁改动前端时，部署脚本会同时换上新的 `web/dist`，无需额外处理
+
+## 分支
+
+| 分支 | 用途 |
+| --- | --- |
+| `hotpatch` | 默认分支，即本分支：补丁、工作流、脚本和文档 |
+| `luck7x/v3.29.7-account-warmup` | 补丁在 v3.29.7 上的完整源码，供查看和比对 |
+| `main` | 早期的 3.16 定制版本，已不再使用 |

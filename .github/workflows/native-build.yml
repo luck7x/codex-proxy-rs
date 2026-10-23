@@ -1,0 +1,272 @@
+name: Native Build
+
+# 只允许手动运行：拉取上游指定 tag，按顺序打上 patches/ 下的热补丁，检查后编译 Linux amd64 发行包
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: '上游版本 tag，例如 v3.29.7'
+        required: true
+        default: v3.29.7
+        type: string
+      build:
+        description: '同一上游版本的补丁构建序号，产物版本为 <版本>+luck7x.<序号>'
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-build-${{ inputs.upstream_tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      rust: ${{ steps.toolchains.outputs.rust }}
+      rust_image: ${{ steps.toolchains.outputs.rust_image }}
+      node: ${{ steps.toolchains.outputs.node }}
+    steps:
+      - name: Checkout hotpatch tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tooling
+
+      - name: Resolve version
+        id: meta
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          [[ "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::upstream_tag 必须形如 v3.29.7"; exit 1; }
+          [[ "$BUILD" =~ ^[1-9][0-9]*$ ]] || { echo "::error::build 必须是正整数"; exit 1; }
+          echo "version=${UPSTREAM_TAG#v}+luck7x.${BUILD}" >> "$GITHUB_OUTPUT"
+
+      - name: Apply hotpatches
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: tooling/scripts/prepare-source.sh "$UPSTREAM_TAG" src
+
+      # 工具链版本跟随上游该版本的 rust-toolchain.toml 与 Dockerfile
+      - name: Read build toolchains
+        id: toolchains
+        working-directory: src
+        run: ruby .github/scripts/toolchains.rb >> "$GITHUB_OUTPUT"
+
+      - name: Archive patched source
+        run: tar --exclude=.git -czf patched-source.tar.gz -C src .
+
+      - name: Upload patched source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: patched-source
+          path: patched-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  checks:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+    steps:
+      - name: Download patched source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: patched-source
+
+      - name: Extract patched source
+        run: mkdir src && tar -xzf patched-source.tar.gz -C src
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ needs.prepare.outputs.rust }}
+          components: rustfmt,clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src/backend -> target
+
+      - name: Rust format
+        working-directory: src/backend
+        run: cargo fmt --check
+
+      # 只检查补丁涉及的 crate；新增补丁改动其他 crate 时同步扩展
+      - name: OpenAI provider clippy
+        working-directory: src/backend
+        run: cargo clippy --locked -p provider-openai --all-targets -- -D warnings
+
+      - name: OpenAI provider tests
+        working-directory: src/backend
+        run: cargo test --locked -p provider-openai --test main credential::quota
+
+  frontend:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download patched source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: patched-source
+
+      - name: Extract patched source
+        run: mkdir src && tar -xzf patched-source.tar.gz -C src
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: src/frontend/package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ needs.prepare.outputs.node }}
+          cache: pnpm
+          cache-dependency-path: src/frontend/pnpm-lock.yaml
+
+      - name: Build frontend
+        run: |
+          pnpm --dir src/frontend install --frozen-lockfile
+          pnpm --dir src/frontend build
+
+      - name: Upload frontend
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-frontend-dist
+          path: src/frontend/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  backend:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Download patched source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: patched-source
+
+      - name: Extract patched source
+        run: mkdir src && tar -xzf patched-source.tar.gz -C src
+
+      - name: Cache Cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/backend/target
+          key: native-cargo-${{ needs.prepare.outputs.rust_image }}-${{ hashFiles('src/backend/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            native-cargo-${{ needs.prepare.outputs.rust_image }}-${{ hashFiles('src/backend/Cargo.lock') }}-
+            native-cargo-${{ needs.prepare.outputs.rust_image }}-
+
+      - name: Build Linux amd64 binary
+        shell: bash
+        env:
+          RUST_IMAGE: ${{ needs.prepare.outputs.rust_image }}
+          CPR_VERSION: ${{ needs.prepare.outputs.version }}
+          CPR_GIT_SHA: ${{ github.sha }}
+          CPR_BUILD_TIME: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo" dist/binary
+          docker run --rm \
+            --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/cargo \
+            -e HOME=/tmp \
+            -e CPR_VERSION \
+            -e CPR_GIT_SHA \
+            -e CPR_BUILD_TIME \
+            -e CPR_BUILD_TYPE=release \
+            -v "$HOME/.cargo:/cargo" \
+            -v "$PWD/src:/workspace" \
+            -w /workspace/backend \
+            "$RUST_IMAGE" \
+            cargo build --release --locked --target x86_64-unknown-linux-gnu --bin codex-proxy-rs
+          cp src/backend/target/x86_64-unknown-linux-gnu/release/codex-proxy-rs dist/binary/
+
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-binary
+          path: dist/binary/codex-proxy-rs
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    # 检查不通过时不产出发行包
+    needs: [prepare, checks, frontend, backend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download patched source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: patched-source
+
+      - name: Extract patched source
+        run: mkdir src && tar -xzf patched-source.tar.gz -C src
+
+      - name: Download frontend
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-frontend-dist
+          path: package/codex-proxy-rs/web/dist
+
+      - name: Download binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-binary
+          path: package/codex-proxy-rs
+
+      # 官方插件清单的版本与 git sha 必须和程序一致，宿主才接受；自编译版本不附带官方插件
+      - name: Package native bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          chmod 0755 package/codex-proxy-rs/codex-proxy-rs
+          mkdir -p package/codex-proxy-rs/deploy package/codex-proxy-rs/plugins/official dist/release
+          cp src/deploy/config.example.yaml package/codex-proxy-rs/deploy/config.example.yaml
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          manifest = {
+              "schema_version": 1,
+              "sealed": True,
+              "gateway_version": os.environ["VERSION"],
+              "gateway_git_sha": os.environ["GIT_SHA"],
+              "plugin_host": json.loads(Path("src/backend/crates/gateway-plugin/runtime/plugin-host-compatibility.json").read_text()),
+              "plugins": [],
+          }
+          path = Path("package/codex-proxy-rs/plugins/official/plugin-release-manifest.json")
+          path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          path.chmod(0o444)
+          PY
+          tar -C package -czf "dist/release/codex-proxy-rs_${VERSION}_linux_amd64.tar.gz" codex-proxy-rs
+          (cd dist/release && sha256sum ./*.tar.gz | sed 's| \./| |' > checksums.txt)
+
+      - name: Upload native bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-proxy-rs-native-${{ needs.prepare.outputs.version }}
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 30

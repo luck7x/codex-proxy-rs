@@ -279,7 +279,13 @@ async fn warmup_treats_full_window_placeholder_as_not_started() {
         .expect("epoch")
         .as_secs();
     // 上游对未开始的窗口返回 0 用量，重置时间为观测时刻加完整 5h
-    seed_short_term_window(&store, "acct_window_placeholder", observed_at, observed + 18_000).await;
+    seed_short_term_window(
+        &store,
+        "acct_window_placeholder",
+        observed_at,
+        observed + 18_000,
+    )
+    .await;
     // 同样 0 用量但观测时只剩 2h，说明窗口已经开始
     seed_short_term_window(&store, "acct_window_started", observed_at, observed + 7_200).await;
     let service = quota_service_with_base_url(

@@ -79,7 +79,8 @@ fn short_term_window_not_started(window: &CodexQuotaWindow, observed_at: SystemT
     if window.limit_reached() || window.used_percent().is_none_or(|used| used > 0.0) {
         return false;
     }
-    let (Some(reset_at), Some(window_seconds)) = (window.reset_at(), window.window_seconds()) else {
+    let (Some(reset_at), Some(window_seconds)) = (window.reset_at(), window.window_seconds())
+    else {
         return false;
     };
     let Some(placeholder_reset) = observed_at.checked_add(Duration::from_secs(window_seconds))

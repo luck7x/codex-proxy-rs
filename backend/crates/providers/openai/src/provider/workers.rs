@@ -408,8 +408,7 @@ impl ScheduledTask for OpenAiWarmupTask {
                 .warmup_due_accounts(hour, minute, global_due)
                 .await
                 .map_err(|error| {
-                    WorkerTaskError::safe("OpenAI warmup account listing failed")
-                        .with_source(error)
+                    WorkerTaskError::safe("OpenAI warmup account listing failed").with_source(error)
                 })?;
             if accounts.is_empty() {
                 return Ok(());

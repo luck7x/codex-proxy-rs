@@ -1,6 +1,96 @@
-//! 账号额度窗口预热与完成事件校验
+//! 账号额度窗口预热、单号预热时刻与完成事件校验
 
 use super::*;
+
+/// 账号备注中的单号预热标记键，如 `预激活=07:30,12:30`
+const ACCOUNT_WARMUP_NOTE_KEYS: [&str; 2] = ["预激活", "warmup"];
+/// 标记值以这些词开头时该账号不参与预热
+const ACCOUNT_WARMUP_NOTE_OFF: [&str; 2] = ["关闭", "off"];
+/// 本地观测时间与上游按秒取整的重置时间之间允许的偏差
+const NOT_STARTED_WINDOW_TOLERANCE: Duration = Duration::from_secs(120);
+
+/// 账号预热时刻的来源
+#[derive(Debug, PartialEq, Eq)]
+enum AccountWarmupSchedule {
+    /// 备注未声明，跟随全局时间表
+    Global,
+    /// 备注声明不参与预热
+    Disabled,
+    /// 只在备注列出的本地时刻预热
+    Times(Vec<(u32, u32)>),
+    /// 备注标记格式无效，跟随全局时间表并告警
+    Invalid,
+}
+
+/// 备注沿用全局时间表的 `HH:MM` 逗号列表格式
+/// 标记前后可以有其他备注，值遇到时间字符以外的内容即结束
+fn account_warmup_schedule(notes: Option<&str>) -> AccountWarmupSchedule {
+    let Some(notes) = notes else {
+        return AccountWarmupSchedule::Global;
+    };
+    // 只折叠 ASCII 大小写，字节偏移与原文一致
+    let lowered = notes.to_ascii_lowercase();
+    for key in ACCOUNT_WARMUP_NOTE_KEYS {
+        for (index, _) in lowered.match_indices(key) {
+            let Some(value) = lowered[index + key.len()..]
+                .trim_start()
+                .strip_prefix(['=', '＝'])
+            else {
+                continue;
+            };
+            return parse_account_warmup_value(value.trim_start());
+        }
+    }
+    AccountWarmupSchedule::Global
+}
+
+fn parse_account_warmup_value(value: &str) -> AccountWarmupSchedule {
+    if ACCOUNT_WARMUP_NOTE_OFF
+        .iter()
+        .any(|off| value.starts_with(off))
+    {
+        return AccountWarmupSchedule::Disabled;
+    }
+    let times = value
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || matches!(*c, ':' | ',' | '，' | ' ' | '\t'))
+        .filter_map(|c| match c {
+            ' ' | '\t' => None,
+            '，' => Some(','),
+            c => Some(c),
+        })
+        .collect::<String>();
+    let times = times.trim_end_matches(',');
+    if !gateway_core::provider_ports::valid_warmup_schedule_time(times) {
+        return AccountWarmupSchedule::Invalid;
+    }
+    AccountWarmupSchedule::Times(
+        times
+            .split(',')
+            .filter_map(|part| Some((part[..2].parse().ok()?, part[3..].parse().ok()?)))
+            .collect(),
+    )
+}
+
+/// 上游对尚未开始计时的窗口返回 0 用量，重置时间为观测时刻加完整窗口时长
+/// 该占位不代表窗口已开始，不能按活跃窗口跳过
+/// 刚开始且用量仍取整为 0 的窗口也会命中，只会多发一次预热请求，不会重启窗口
+fn short_term_window_not_started(window: &CodexQuotaWindow, observed_at: SystemTime) -> bool {
+    if window.limit_reached() || window.used_percent().is_none_or(|used| used > 0.0) {
+        return false;
+    }
+    let (Some(reset_at), Some(window_seconds)) = (window.reset_at(), window.window_seconds()) else {
+        return false;
+    };
+    let Some(placeholder_reset) = observed_at.checked_add(Duration::from_secs(window_seconds))
+    else {
+        return false;
+    };
+    let drift = SystemTime::from(reset_at)
+        .duration_since(placeholder_reset)
+        .unwrap_or_else(|error| error.duration());
+    drift <= NOT_STARTED_WINDOW_TOLERANCE
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WarmupTerminal {
@@ -71,20 +161,52 @@ async fn consume_warmup_sse(
 }
 
 impl CodexCredentialQuotaService {
-    /// 批量预激活 OAuth 账号的 5h 配额滑动窗口
-    pub async fn execute_warmup(
+    /// 选出本地时刻 `hour:minute` 应预热的 OAuth 账号
+    ///
+    /// 备注声明单号时刻的账号只按自身时刻执行，其余账号在 `global_due` 时跟随全局时间表
+    pub async fn warmup_due_accounts(
         &self,
-        model: &str,
-    ) -> Result<CodexWarmupSummary, CodexCredentialQuotaError> {
+        hour: u32,
+        minute: u32,
+        global_due: bool,
+    ) -> Result<Vec<ProviderAccount>, CodexCredentialQuotaError> {
         let mut accounts = self.repository.list_for_provider().await?;
         accounts.retain(|account| {
-            account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+            let eligible = account.authentication_kind()
+                == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
                 && account.enabled()
                 && matches!(
                     account.credential_state(),
                     CredentialState::Unknown | CredentialState::Ready
-                )
+                );
+            if !eligible {
+                return false;
+            }
+            match account_warmup_schedule(account.notes()) {
+                AccountWarmupSchedule::Global => global_due,
+                AccountWarmupSchedule::Disabled => false,
+                AccountWarmupSchedule::Times(times) => times.contains(&(hour, minute)),
+                AccountWarmupSchedule::Invalid => {
+                    // 只在全局时刻告警，避免每个检查周期重复输出
+                    if global_due {
+                        tracing::warn!(
+                            account_id = %account.id(),
+                            "OpenAI account warmup note is invalid, following the global schedule"
+                        );
+                    }
+                    global_due
+                }
+            }
         });
+        Ok(accounts)
+    }
+
+    /// 预激活给定 OAuth 账号的 5h 配额滑动窗口，账号之间间隔发送
+    pub async fn execute_warmup(
+        &self,
+        model: &str,
+        accounts: Vec<ProviderAccount>,
+    ) -> Result<CodexWarmupSummary, CodexCredentialQuotaError> {
         let mut summary = CodexWarmupSummary::default();
         if accounts.is_empty() {
             return Ok(summary);
@@ -123,6 +245,7 @@ impl CodexCredentialQuotaService {
                 // 2. 5h 窗口当前活跃且距重置时间 > 30 分钟跳过
                 let has_active_5h = snapshot.windows().iter().any(|w| {
                     w.kind() == CodexQuotaWindowKind::ShortTerm
+                        && !short_term_window_not_started(w, snapshot.observed_at())
                         && w.reset_at().is_some_and(|reset_at| {
                             reset_at > now_utc + chrono::Duration::minutes(30)
                         })

@@ -398,11 +398,20 @@ impl ScheduledTask for OpenAiWarmupTask {
             }
             let hour = local_now.time().hour();
             let minute = local_now.time().minute();
-            let scheduled_times = policy.scheduled_times();
-            let matched = scheduled_times
+            let global_due = policy
+                .scheduled_times()
                 .iter()
                 .any(|&(h, m)| h == hour && m == minute);
-            if !matched {
+            // 账号备注可声明单号时刻，非全局时刻也要检查是否有账号到点
+            let accounts = self
+                .quota
+                .warmup_due_accounts(hour, minute, global_due)
+                .await
+                .map_err(|error| {
+                    WorkerTaskError::safe("OpenAI warmup account listing failed")
+                        .with_source(error)
+                })?;
+            if accounts.is_empty() {
                 return Ok(());
             }
             let Some(model) = policy.model() else {
@@ -424,10 +433,17 @@ impl ScheduledTask for OpenAiWarmupTask {
             {
                 return Ok(());
             }
-            tracing::info!(hour, minute, model, "OpenAI account warmup cycle started");
+            tracing::info!(
+                hour,
+                minute,
+                model,
+                accounts = accounts.len(),
+                global_due,
+                "OpenAI account warmup cycle started"
+            );
             let outcome = tokio::select! {
                 () = context.cancellation().cancelled() => return Ok(()),
-                outcome = self.quota.execute_warmup(model) => outcome,
+                outcome = self.quota.execute_warmup(model, accounts) => outcome,
             };
             match outcome {
                 Ok(summary) => {

@@ -162,6 +162,13 @@ impl MemoryAccountStore {
             .with_scheduling(concurrency_limit, weight);
     }
 
+    pub(crate) fn set_notes(&self, id: &str, notes: &str) {
+        let id = ProviderAccountId::new(id).expect("valid account ID");
+        let mut accounts = self.accounts.lock().expect("account store lock");
+        let stored = accounts.get_mut(&id).expect("seeded account");
+        stored.account = stored.account.clone().with_notes(Some(notes.to_owned()));
+    }
+
     pub(crate) fn set_egress(
         &self,
         id: &str,

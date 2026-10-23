@@ -1,0 +1,204 @@
+name: Native Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build'
+        required: true
+        default: main
+        type: string
+      version:
+        description: 'Semver build version, for example 3.29.7+luck7x.1'
+        required: true
+        default: 3.29.7+luck7x.1
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-build-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: frontend/package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build frontend
+        run: |
+          pnpm --dir frontend install --frozen-lockfile
+          pnpm --dir frontend build
+
+      - name: Upload frontend
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.99.1'
+          components: rustfmt,clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: backend -> target
+
+      - name: Rust format
+        working-directory: backend
+        run: cargo fmt --check
+
+      - name: OpenAI provider clippy
+        working-directory: backend
+        run: cargo clippy --locked -p provider-openai --all-targets -- -D warnings
+
+      - name: OpenAI provider tests
+        working-directory: backend
+        run: cargo test --locked -p provider-openai --test main credential::quota
+
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Cache Cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: native-cargo-${{ hashFiles('backend/Cargo.lock', 'backend/rust-toolchain.toml', 'backend/**/Cargo.toml', 'backend/.cargo/config.toml') }}-${{ github.sha }}
+          restore-keys: |
+            native-cargo-${{ hashFiles('backend/Cargo.lock', 'backend/rust-toolchain.toml', 'backend/**/Cargo.toml', 'backend/.cargo/config.toml') }}-
+
+      - name: Build Linux amd64 binary
+        shell: bash
+        env:
+          CPR_VERSION: ${{ inputs.version }}
+          CPR_GIT_SHA: ${{ github.sha }}
+          CPR_BUILD_TIME: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo" dist/binary
+          docker run --rm \
+            --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/cargo \
+            -e HOME=/tmp \
+            -e CPR_VERSION \
+            -e CPR_GIT_SHA \
+            -e CPR_BUILD_TIME \
+            -e CPR_BUILD_TYPE=release \
+            -v "$HOME/.cargo:/cargo" \
+            -v "$PWD:/workspace" \
+            -w /workspace/backend \
+            rust:1.99.1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 \
+            cargo build --release --locked --target x86_64-unknown-linux-gnu --bin codex-proxy-rs
+          cp backend/target/x86_64-unknown-linux-gnu/release/codex-proxy-rs dist/binary/
+
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-binary
+          path: dist/binary/codex-proxy-rs
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    needs: [frontend, backend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Download frontend
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-frontend-dist
+          path: package/codex-proxy-rs/web/dist
+
+      - name: Download binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-binary
+          path: package/codex-proxy-rs
+
+      - name: Package native bundle
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          chmod 0755 package/codex-proxy-rs/codex-proxy-rs
+          mkdir -p package/codex-proxy-rs/deploy package/codex-proxy-rs/plugins/official dist/release
+          cp deploy/config.example.yaml package/codex-proxy-rs/deploy/config.example.yaml
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          manifest = {
+              "schema_version": 1,
+              "sealed": True,
+              "gateway_version": os.environ["VERSION"],
+              "gateway_git_sha": os.environ["GIT_SHA"],
+              "plugin_host": json.loads(Path("backend/crates/gateway-plugin/runtime/plugin-host-compatibility.json").read_text()),
+              "plugins": [],
+          }
+          path = Path("package/codex-proxy-rs/plugins/official/plugin-release-manifest.json")
+          path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          path.chmod(0o444)
+          PY
+          tar -C package -czf "dist/release/codex-proxy-rs_${VERSION}_linux_amd64.tar.gz" codex-proxy-rs
+          sha256sum dist/release/*.tar.gz > dist/release/checksums.txt
+
+      - name: Upload native bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-proxy-rs-native-${{ inputs.version }}
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 30

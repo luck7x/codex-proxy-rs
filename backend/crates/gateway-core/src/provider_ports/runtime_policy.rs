@@ -58,6 +58,19 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
     ) -> BoxFuture<'_, Result<ProviderWarmupPolicy, ProviderStoreError>> {
         Box::pin(async move { Ok(ProviderWarmupPolicy::disabled()) })
     }
+
+    /// 读取账号单独的预激活排期；默认没有排期，全部账号跟随全局时间表
+    fn load_account_warmup_schedules(
+        &self,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            std::collections::BTreeMap<String, super::AccountWarmupSchedule>,
+            ProviderStoreError,
+        >,
+    > {
+        Box::pin(async move { Ok(std::collections::BTreeMap::new()) })
+    }
 }
 
 /// 账号容量熔断（自动冻结）策略；来源于 `runtime_settings`，

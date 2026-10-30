@@ -174,6 +174,20 @@ pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResul
 }
 
 impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
+    fn load_account_warmup_schedules(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<
+            BTreeMap<String, gateway_core::provider_ports::AccountWarmupSchedule>,
+            ProviderStoreError,
+        >,
+    > {
+        Box::pin(super::provider_accounts::load_account_warmup_schedules(
+            &self.pool,
+        ))
+    }
+
     fn claim_warmup_slot<'a>(
         &'a self,
         timezone: gateway_core::time::DeploymentTimeZone,

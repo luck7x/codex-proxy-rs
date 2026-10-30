@@ -112,6 +112,28 @@ pub type AdminStoreResult<T> = Result<T, AdminStoreError>;
 pub trait AccountStore:
     super::reset_credit_automation::ResetCreditAutomationStore + Send + Sync
 {
+    /// 读取账号单独的预激活排期，`None` 表示跟随全局时间表
+    async fn account_warmup_schedule(
+        &self,
+        _account_id: &str,
+    ) -> AdminStoreResult<Option<gateway_core::provider_ports::AccountWarmupSchedule>> {
+        Ok(None)
+    }
+
+    /// 保存账号单独的预激活排期，`None` 恢复跟随全局时间表
+    async fn save_account_warmup_schedule(
+        &self,
+        _account_id: &str,
+        _schedule: Option<&gateway_core::provider_ports::AccountWarmupSchedule>,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<()> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "account warmup",
+            "store does not support account warmup",
+        ))
+    }
+
     /// 插件回调按授权 Provider/账号在数据库过滤后做稳定 cursor 分页
     async fn list_plugin_accounts(
         &self,

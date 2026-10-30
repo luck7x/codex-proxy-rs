@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+mod account_warmup;
 mod admin_adapter;
 mod authorization;
 mod deletion;

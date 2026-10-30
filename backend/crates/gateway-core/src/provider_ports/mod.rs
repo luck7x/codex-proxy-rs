@@ -27,6 +27,8 @@ pub use cooldown::{
 };
 mod refresh;
 pub use refresh::{ProviderRefreshPolicy, provider_refresh_backoff_at, provider_refresh_retry_at};
+mod account_warmup;
+pub use account_warmup::AccountWarmupSchedule;
 mod runtime_policy;
 pub use runtime_policy::{
     ProviderFreezePolicy, ProviderRuntimePolicyPort, ProviderWarmupPolicy,

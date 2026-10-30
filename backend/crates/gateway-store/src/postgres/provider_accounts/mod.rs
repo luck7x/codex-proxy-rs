@@ -53,6 +53,9 @@ use super::{
     append_admin_audit_event_in_transaction, bump_config_revision_in_transaction,
 };
 
+mod account_warmup;
+pub use account_warmup::ensure_account_warmup_schema;
+pub(super) use account_warmup::load_account_warmup_schedules;
 mod admin_adapter;
 mod admin_queries;
 mod authorization;

@@ -132,6 +132,22 @@ pub trait AccountsService: Send + Sync {
         Err(AdminError::invalid("当前 Provider 不支持账号头像"))
     }
 
+    async fn account_warmup_schedule(
+        &self,
+        _account_id: ProviderAccountId,
+    ) -> Result<Option<gateway_core::provider_ports::AccountWarmupSchedule>, AdminError> {
+        Err(AdminError::invalid("账号不支持单独预激活"))
+    }
+
+    async fn set_account_warmup_schedule(
+        &self,
+        _context: &MutationContext,
+        _account_id: ProviderAccountId,
+        _times: Option<Vec<String>>,
+    ) -> Result<Option<gateway_core::provider_ports::AccountWarmupSchedule>, AdminError> {
+        Err(AdminError::invalid("账号不支持单独预激活"))
+    }
+
     async fn reset_credit_automation_status(
         &self,
         _account_id: ProviderAccountId,
@@ -952,6 +968,56 @@ impl AccountsService for DefaultAccountsService {
             .profile_avatar(account_id)
             .await
             .map_err(|error| map_provider_error(error, "provider profile avatar"))
+    }
+
+    async fn account_warmup_schedule(
+        &self,
+        account_id: ProviderAccountId,
+    ) -> Result<Option<gateway_core::provider_ports::AccountWarmupSchedule>, AdminError> {
+        // 没有排期记录表示跟随全局，账号是否存在要单独确认
+        if !self
+            .accounts
+            .account_exists(account_id.as_str())
+            .await
+            .map_err(|error| map_store_error(error, "account warmup"))?
+        {
+            return Err(AdminError::not_found("账号不存在"));
+        }
+        self.accounts
+            .account_warmup_schedule(account_id.as_str())
+            .await
+            .map_err(|error| map_store_error(error, "account warmup"))
+    }
+
+    async fn set_account_warmup_schedule(
+        &self,
+        context: &MutationContext,
+        account_id: ProviderAccountId,
+        times: Option<Vec<String>>,
+    ) -> Result<Option<gateway_core::provider_ports::AccountWarmupSchedule>, AdminError> {
+        let schedule = times
+            .map(gateway_core::provider_ports::AccountWarmupSchedule::try_new)
+            .transpose()
+            .map_err(AdminError::invalid)?;
+        if !self
+            .accounts
+            .account_exists(account_id.as_str())
+            .await
+            .map_err(|error| map_store_error(error, "account warmup"))?
+        {
+            return Err(AdminError::not_found("账号不存在"));
+        }
+        self.accounts
+            .save_account_warmup_schedule(account_id.as_str(), schedule.as_ref(), context)
+            .await
+            .map_err(|error| map_store_error(error, "account warmup"))?;
+        let settings = self
+            .settings
+            .load_runtime_settings()
+            .await
+            .map_err(|error| map_store_error(error, "runtime settings"))?;
+        publish_committed(self.snapshot.as_ref(), settings.config_revision).await?;
+        Ok(schedule)
     }
 
     async fn reset_credit_automation_status(

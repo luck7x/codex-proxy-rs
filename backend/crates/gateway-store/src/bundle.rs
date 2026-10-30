@@ -121,7 +121,9 @@ async fn connect(
     let pool = if read_only {
         postgres::connect_read_only(&database_url, config.pool).await?
     } else {
-        postgres::connect_and_migrate(&database_url, config.pool).await?
+        let pool = postgres::connect_and_migrate(&database_url, config.pool).await?;
+        postgres::ensure_account_warmup_schema(&pool).await?;
+        pool
     };
     let observability_query_budget = postgres::ObservabilityQueryBudget::try_new(
         config.pool.observability_max_connections(),

@@ -225,6 +225,23 @@ impl PgAdminAccountStore {
 
 #[async_trait]
 impl AccountStore for PgAdminAccountStore {
+    async fn account_warmup_schedule(
+        &self,
+        account_id: &str,
+    ) -> AdminStoreResult<Option<gateway_core::provider_ports::AccountWarmupSchedule>> {
+        self.load_account_warmup(account_id).await
+    }
+
+    async fn save_account_warmup_schedule(
+        &self,
+        account_id: &str,
+        schedule: Option<&gateway_core::provider_ports::AccountWarmupSchedule>,
+        context: &MutationContext,
+    ) -> AdminStoreResult<()> {
+        self.store_account_warmup(account_id, schedule, context)
+            .await
+    }
+
     async fn account_exists(&self, account_id: &str) -> AdminStoreResult<bool> {
         sqlx::query_scalar("select exists(select 1 from provider_accounts where id = $1)")
             .bind(account_id)

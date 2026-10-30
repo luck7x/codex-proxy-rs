@@ -1,6 +1,89 @@
-//! 验证额度预热按 SSE 终态判定结果、请求档位并跳过过期凭据
+//! 验证额度预热按 SSE 终态判定结果、请求档位、单号排期与窗口占位，并跳过过期凭据
+
+use std::time::UNIX_EPOCH;
+
+use std::{collections::BTreeMap, num::NonZeroU32};
+
+use futures::future::BoxFuture;
+use gateway_core::account::{OpaqueProviderData, QuotaObservation};
+use gateway_core::provider_ports::{
+    AccountWarmupSchedule, ProviderRefreshPolicy, ProviderRuntimePolicyPort, ProviderStoreError,
+};
 
 use super::*;
+
+struct ScheduledRuntimePolicy(BTreeMap<String, AccountWarmupSchedule>);
+
+impl ProviderRuntimePolicyPort for ScheduledRuntimePolicy {
+    fn load_refresh_policy(
+        &self,
+    ) -> BoxFuture<'_, Result<ProviderRefreshPolicy, ProviderStoreError>> {
+        Box::pin(async {
+            ProviderRefreshPolicy::try_new(
+                Duration::from_secs(60 * 60),
+                NonZeroU32::new(2).expect("positive concurrency"),
+            )
+        })
+    }
+
+    fn load_account_warmup_schedules(
+        &self,
+    ) -> BoxFuture<'_, Result<BTreeMap<String, AccountWarmupSchedule>, ProviderStoreError>> {
+        let schedules = self.0.clone();
+        Box::pin(async move { Ok(schedules) })
+    }
+}
+
+async fn due_account_ids(
+    service: &CodexCredentialQuotaService,
+    hour: u32,
+    minute: u32,
+    global_due: bool,
+) -> Vec<String> {
+    let mut ids = service
+        .warmup_due_accounts(hour, minute, global_due)
+        .await
+        .expect("due accounts")
+        .iter()
+        .map(|account| account.id().to_string())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+async fn seed_short_term_window(
+    store: &Arc<MemoryAccountStore>,
+    id: &str,
+    observed_at: SystemTime,
+    reset_at: u64,
+) {
+    create_account(store, id).await;
+    let account = store.account(id).expect("created account");
+    store
+        .compare_and_swap_quota(QuotaObservation {
+            plan_type: None,
+            account_id: account.id().clone(),
+            expected_revision: account.revision(),
+            quota: OpaqueProviderData::new(
+                json!({"rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 0,
+                        "reset_at": reset_at,
+                        "limit_window_seconds": 18_000
+                    }
+                }})
+                .as_object()
+                .expect("quota object")
+                .clone(),
+            ),
+            observed_at,
+            state: QuotaState::allowed(observed_at),
+        })
+        .await
+        .expect("persist quota");
+}
 
 #[tokio::test]
 async fn warmup_consumes_completed_sse_and_persists_rate_limit_event() {
@@ -29,7 +112,14 @@ async fn warmup_consumes_completed_sse_and_persists_rate_limit_event() {
         server.uri(),
     );
 
-    let summary = service.execute_warmup("test-model").await.expect("warmup");
+    let accounts = service
+        .warmup_due_accounts(8, 0, true)
+        .await
+        .expect("due accounts");
+    let summary = service
+        .execute_warmup("test-model", accounts)
+        .await
+        .expect("warmup");
 
     assert_eq!(summary.warmed_up, 1);
     assert_eq!(summary.failed, 0);
@@ -65,7 +155,14 @@ async fn warmup_sends_the_lowest_reasoning_effort_supported_by_the_catalog() {
         server.uri(),
     );
 
-    let summary = service.execute_warmup("test-model").await.expect("warmup");
+    let accounts = service
+        .warmup_due_accounts(8, 0, true)
+        .await
+        .expect("due accounts");
+    let summary = service
+        .execute_warmup("test-model", accounts)
+        .await
+        .expect("warmup");
 
     assert_eq!(summary.warmed_up, 1);
     let requests = server.received_requests().await.expect("recorded requests");
@@ -108,7 +205,14 @@ async fn warmup_rejects_failed_sse_despite_successful_http_headers() {
         server.uri(),
     );
 
-    let summary = service.execute_warmup("test-model").await.expect("warmup");
+    let accounts = service
+        .warmup_due_accounts(8, 0, true)
+        .await
+        .expect("due accounts");
+    let summary = service
+        .execute_warmup("test-model", accounts)
+        .await
+        .expect("warmup");
 
     assert_eq!(summary.warmed_up, 0);
     assert_eq!(summary.failed, 1);
@@ -137,8 +241,110 @@ async fn warmup_skips_expired_credential() {
         server.uri(),
     );
 
-    let summary = service.execute_warmup("test-model").await.expect("warmup");
+    let accounts = service
+        .warmup_due_accounts(8, 0, true)
+        .await
+        .expect("due accounts");
+    let summary = service
+        .execute_warmup("test-model", accounts)
+        .await
+        .expect("warmup");
 
     assert_eq!(summary.warmed_up, 0);
+    assert_eq!(summary.failed, 0);
+}
+
+#[tokio::test]
+async fn warmup_due_accounts_follow_account_schedule() {
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in ["acct_global", "acct_off", "acct_own"] {
+        create_account(&store, id).await;
+    }
+    // 备注只是文字，不参与预热排期
+    store.set_notes("acct_global", "预激活=关闭");
+    let schedules = BTreeMap::from([
+        (
+            "acct_own".to_owned(),
+            AccountWarmupSchedule::try_new(vec!["07:30".to_owned(), "12:30".to_owned()])
+                .expect("valid schedule"),
+        ),
+        (
+            "acct_off".to_owned(),
+            AccountWarmupSchedule::try_new(Vec::new()).expect("empty schedule"),
+        ),
+    ]);
+    let service = CodexCredentialQuotaService::new(
+        store.repository(),
+        wire_profile(),
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client"),
+        OFFICIAL_CODEX_BASE_URL.to_owned(),
+        Arc::new(crate::support::MemoryCooldownPort::new()),
+        Arc::new(crate::support::TestLeaseCoordinator::default()),
+        Arc::new(ScheduledRuntimePolicy(schedules)),
+    );
+
+    // 单号排期不依赖全局时间表，没有排期的账号只跟随全局时刻
+    assert_eq!(due_account_ids(&service, 7, 30, false).await, ["acct_own"]);
+    assert_eq!(
+        due_account_ids(&service, 12, 30, true).await,
+        ["acct_global", "acct_own"]
+    );
+    assert_eq!(due_account_ids(&service, 8, 0, true).await, ["acct_global"]);
+    assert!(due_account_ids(&service, 8, 0, false).await.is_empty());
+}
+
+#[tokio::test]
+async fn warmup_treats_full_window_placeholder_as_not_started() {
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_warmup_placeholder\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryAccountStore::default());
+    let observed_at = SystemTime::now() - Duration::from_secs(10 * 60);
+    let observed = observed_at
+        .duration_since(UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    // 上游对未开始的窗口返回 0 用量，重置时间为观测时刻加完整 5h
+    seed_short_term_window(
+        &store,
+        "acct_window_placeholder",
+        observed_at,
+        observed + 18_000,
+    )
+    .await;
+    // 同样 0 用量但观测时只剩 2h，说明窗口已经开始
+    seed_short_term_window(&store, "acct_window_started", observed_at, observed + 7_200).await;
+    let service = quota_service_with_base_url(
+        &store,
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client"),
+        server.uri(),
+    );
+
+    let accounts = service
+        .warmup_due_accounts(8, 0, true)
+        .await
+        .expect("due accounts");
+    let summary = service
+        .execute_warmup("test-model", accounts)
+        .await
+        .expect("warmup");
+
+    assert_eq!(summary.warmed_up, 1);
+    assert_eq!(summary.skipped_active, 1);
     assert_eq!(summary.failed, 0);
 }

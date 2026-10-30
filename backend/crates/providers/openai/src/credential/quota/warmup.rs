@@ -1,6 +1,30 @@
-//! 账号额度窗口预热与完成事件校验
+//! 账号额度窗口预热、未开始窗口识别与完成事件校验
 
 use super::*;
+
+/// 本地观测时间与上游按秒取整的重置时间之间允许的偏差
+const NOT_STARTED_WINDOW_TOLERANCE: Duration = Duration::from_secs(120);
+
+/// 上游对尚未开始计时的窗口返回 0 用量，重置时间为观测时刻加完整窗口时长
+/// 该占位不代表窗口已开始，不能按活跃窗口跳过
+/// 刚开始且用量仍取整为 0 的窗口也会命中，只会多发一次预热请求，不会重启窗口
+fn short_term_window_not_started(window: &CodexQuotaWindow, observed_at: SystemTime) -> bool {
+    if window.limit_reached() || window.used_percent().is_none_or(|used| used > 0.0) {
+        return false;
+    }
+    let (Some(reset_at), Some(window_seconds)) = (window.reset_at(), window.window_seconds())
+    else {
+        return false;
+    };
+    let Some(placeholder_reset) = observed_at.checked_add(Duration::from_secs(window_seconds))
+    else {
+        return false;
+    };
+    let drift = SystemTime::from(reset_at)
+        .duration_since(placeholder_reset)
+        .unwrap_or_else(|error| error.duration());
+    drift <= NOT_STARTED_WINDOW_TOLERANCE
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WarmupTerminal {
@@ -71,11 +95,22 @@ async fn consume_warmup_sse(
 }
 
 impl CodexCredentialQuotaService {
-    /// 批量预激活 OAuth 账号的 5h 配额滑动窗口
-    pub async fn execute_warmup(
+    /// 选出本地时刻 `hour:minute` 应预热的 OAuth 账号
+    ///
+    /// 有单独排期的账号只按自身时刻执行，其余账号在 `global_due` 时跟随全局时间表
+    pub async fn warmup_due_accounts(
         &self,
-        model: &str,
-    ) -> Result<CodexWarmupSummary, CodexCredentialQuotaError> {
+        hour: u32,
+        minute: u32,
+        global_due: bool,
+    ) -> Result<Vec<ProviderAccount>, CodexCredentialQuotaError> {
+        let schedules = self
+            .runtime_policy()
+            .load_account_warmup_schedules()
+            .await
+            .map_err(|error| CodexCredentialQuotaError::Store {
+                detail: error.to_string(),
+            })?;
         let mut accounts = self.repository.list_for_provider().await?;
         accounts.retain(|account| {
             account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
@@ -84,7 +119,19 @@ impl CodexCredentialQuotaService {
                     account.credential_state(),
                     CredentialState::Unknown | CredentialState::Ready
                 )
+                && schedules
+                    .get(account.id().as_str())
+                    .map_or(global_due, |schedule| schedule.is_due(hour, minute))
         });
+        Ok(accounts)
+    }
+
+    /// 预激活给定 OAuth 账号的 5h 配额滑动窗口，账号之间间隔发送
+    pub async fn execute_warmup(
+        &self,
+        model: &str,
+        accounts: Vec<ProviderAccount>,
+    ) -> Result<CodexWarmupSummary, CodexCredentialQuotaError> {
         let mut summary = CodexWarmupSummary::default();
         if accounts.is_empty() {
             return Ok(summary);
@@ -123,6 +170,7 @@ impl CodexCredentialQuotaService {
                 // 2. 5h 窗口当前活跃且距重置时间 > 30 分钟跳过
                 let has_active_5h = snapshot.windows().iter().any(|w| {
                     w.kind() == CodexQuotaWindowKind::ShortTerm
+                        && !short_term_window_not_started(w, snapshot.observed_at())
                         && w.reset_at().is_some_and(|reset_at| {
                             reset_at > now_utc + chrono::Duration::minutes(30)
                         })

@@ -1,0 +1,679 @@
+后端：账号预激活排期的独立表、管理接口与审计
+
+diff --git a/backend/crates/gateway-admin/src/ports/store.rs b/backend/crates/gateway-admin/src/ports/store.rs
+index a8127e8c4ac7d846ba88aadb1f4b013596ea9acc..b9ff36e14cad5ea1069eb07c1ae773517ad681d1 100644
+--- a/backend/crates/gateway-admin/src/ports/store.rs
++++ b/backend/crates/gateway-admin/src/ports/store.rs
+@@ -112,6 +112,28 @@ pub type AdminStoreResult<T> = Result<T, AdminStoreError>;
+ pub trait AccountStore:
+     super::reset_credit_automation::ResetCreditAutomationStore + Send + Sync
+ {
++    /// 读取账号单独的预激活排期，`None` 表示跟随全局时间表
++    async fn account_warmup_schedule(
++        &self,
++        _account_id: &str,
++    ) -> AdminStoreResult<Option<gateway_core::provider_ports::AccountWarmupSchedule>> {
++        Ok(None)
++    }
++
++    /// 保存账号单独的预激活排期，`None` 恢复跟随全局时间表
++    async fn save_account_warmup_schedule(
++        &self,
++        _account_id: &str,
++        _schedule: Option<&gateway_core::provider_ports::AccountWarmupSchedule>,
++        _context: &MutationContext,
++    ) -> AdminStoreResult<()> {
++        Err(AdminStoreError::new(
++            AdminStoreErrorKind::Unavailable,
++            "account warmup",
++            "store does not support account warmup",
++        ))
++    }
++
+     /// 插件回调按授权 Provider/账号在数据库过滤后做稳定 cursor 分页
+     async fn list_plugin_accounts(
+         &self,
+diff --git a/backend/crates/gateway-admin/src/use_case/accounts/mod.rs b/backend/crates/gateway-admin/src/use_case/accounts/mod.rs
+index 6971d757dab1de9d1ded09458b76ec03206ac4e0..e67bd3bc3042150646fc4b5273a3846f3b477868 100644
+--- a/backend/crates/gateway-admin/src/use_case/accounts/mod.rs
++++ b/backend/crates/gateway-admin/src/use_case/accounts/mod.rs
+@@ -132,6 +132,22 @@ pub trait AccountsService: Send + Sync {
+         Err(AdminError::invalid("当前 Provider 不支持账号头像"))
+     }
+ 
++    async fn account_warmup_schedule(
++        &self,
++        _account_id: ProviderAccountId,
++    ) -> Result<Option<gateway_core::provider_ports::AccountWarmupSchedule>, AdminError> {
++        Err(AdminError::invalid("账号不支持单独预激活"))
++    }
++
++    async fn set_account_warmup_schedule(
++        &self,
++        _context: &MutationContext,
++        _account_id: ProviderAccountId,
++        _times: Option<Vec<String>>,
++    ) -> Result<Option<gateway_core::provider_ports::AccountWarmupSchedule>, AdminError> {
++        Err(AdminError::invalid("账号不支持单独预激活"))
++    }
++
+     async fn reset_credit_automation_status(
+         &self,
+         _account_id: ProviderAccountId,
+@@ -954,6 +970,56 @@ impl AccountsService for DefaultAccountsService {
+             .map_err(|error| map_provider_error(error, "provider profile avatar"))
+     }
+ 
++    async fn account_warmup_schedule(
++        &self,
++        account_id: ProviderAccountId,
++    ) -> Result<Option<gateway_core::provider_ports::AccountWarmupSchedule>, AdminError> {
++        // 没有排期记录表示跟随全局，账号是否存在要单独确认
++        if !self
++            .accounts
++            .account_exists(account_id.as_str())
++            .await
++            .map_err(|error| map_store_error(error, "account warmup"))?
++        {
++            return Err(AdminError::not_found("账号不存在"));
++        }
++        self.accounts
++            .account_warmup_schedule(account_id.as_str())
++            .await
++            .map_err(|error| map_store_error(error, "account warmup"))
++    }
++
++    async fn set_account_warmup_schedule(
++        &self,
++        context: &MutationContext,
++        account_id: ProviderAccountId,
++        times: Option<Vec<String>>,
++    ) -> Result<Option<gateway_core::provider_ports::AccountWarmupSchedule>, AdminError> {
++        let schedule = times
++            .map(gateway_core::provider_ports::AccountWarmupSchedule::try_new)
++            .transpose()
++            .map_err(AdminError::invalid)?;
++        if !self
++            .accounts
++            .account_exists(account_id.as_str())
++            .await
++            .map_err(|error| map_store_error(error, "account warmup"))?
++        {
++            return Err(AdminError::not_found("账号不存在"));
++        }
++        self.accounts
++            .save_account_warmup_schedule(account_id.as_str(), schedule.as_ref(), context)
++            .await
++            .map_err(|error| map_store_error(error, "account warmup"))?;
++        let settings = self
++            .settings
++            .load_runtime_settings()
++            .await
++            .map_err(|error| map_store_error(error, "runtime settings"))?;
++        publish_committed(self.snapshot.as_ref(), settings.config_revision).await?;
++        Ok(schedule)
++    }
++
+     async fn reset_credit_automation_status(
+         &self,
+         account_id: ProviderAccountId,
+diff --git a/backend/crates/gateway-api/src/admin/accounts/handlers.rs b/backend/crates/gateway-api/src/admin/accounts/handlers.rs
+index 7c6cff2f294356d6142c31318740e23d04c37a0e..a09e15db5dc6d5fb6a6c3a7be4a83f4c1cc08934 100644
+--- a/backend/crates/gateway-api/src/admin/accounts/handlers.rs
++++ b/backend/crates/gateway-api/src/admin/accounts/handlers.rs
+@@ -11,6 +11,7 @@ where
+ {
+     Router::new()
+         .merge(super::import_tasks::router::<S>())
++        .merge(super::warmup::router::<S>())
+         .route("/api/admin/accounts", get(list_accounts::<S>))
+         .route(
+             "/api/admin/accounts/concurrency",
+diff --git a/backend/crates/gateway-api/src/admin/accounts/mod.rs b/backend/crates/gateway-api/src/admin/accounts/mod.rs
+index e955bf843ee7aa06d0a947e34201df91f4151af8..3b65dd8caca9bca90dc5ae9503c0f505ad747013 100644
+--- a/backend/crates/gateway-api/src/admin/accounts/mod.rs
++++ b/backend/crates/gateway-api/src/admin/accounts/mod.rs
+@@ -66,6 +66,7 @@ mod credentials;
+ mod handlers;
+ mod import_tasks;
+ mod presenter;
++mod warmup;
+ mod wire;
+ 
+ pub use credentials::*;
+diff --git a/backend/crates/gateway-api/src/admin/accounts/warmup.rs b/backend/crates/gateway-api/src/admin/accounts/warmup.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2eac2d78795f32dd2f9177d18602c41e0c037a7c
+--- /dev/null
++++ b/backend/crates/gateway-api/src/admin/accounts/warmup.rs
+@@ -0,0 +1,84 @@
++//! 账号单独预激活排期的查询与保存
++
++use gateway_core::provider_ports::AccountWarmupSchedule;
++
++use super::*;
++use crate::auth::SessionState;
++
++/// `times` 为 `null` 跟随全局时间表，空数组表示不参与预激活
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++struct SetRequest {
++    account_id: String,
++    times: Option<Vec<String>>,
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct Data {
++    times: Option<Vec<String>>,
++}
++
++impl From<Option<AccountWarmupSchedule>> for Data {
++    fn from(schedule: Option<AccountWarmupSchedule>) -> Self {
++        Self {
++            times: schedule.map(|schedule| schedule.times().to_vec()),
++        }
++    }
++}
++
++pub(super) fn router<S>() -> Router<S>
++where
++    S: SessionState + Clone + Send + Sync + 'static,
++{
++    Router::new().route("/api/admin/accounts/warmup", get(load::<S>).post(save::<S>))
++}
++
++async fn load<S>(
++    _auth: AdminAuth,
++    State(state): State<S>,
++    AdminQuery(query): AdminQuery<AccountIdQuery>,
++) -> Result<impl IntoResponse, AdminError>
++where
++    S: SessionState + Send + Sync,
++{
++    let schedule = state
++        .admin_services()
++        .accounts()
++        .account_warmup_schedule(query.into_id().map_err(map_wire_error)?)
++        .await
++        .map_err(map_service_error)?;
++    Ok(AdminResponse::new(
++        StatusCode::OK,
++        AdminEnvelope::ok(Data::from(schedule)),
++    ))
++}
++
++async fn save<S>(
++    auth: AdminAuth,
++    State(state): State<S>,
++    AdminJson(request): AdminJson<SetRequest>,
++) -> Result<impl IntoResponse, AdminError>
++where
++    S: SessionState + Send + Sync,
++{
++    let account_id = AccountIdQuery {
++        account_id: request.account_id,
++    }
++    .into_id()
++    .map_err(map_wire_error)?;
++    let schedule = state
++        .admin_services()
++        .accounts()
++        .set_account_warmup_schedule(
++            &auth.context().mutation_context(),
++            account_id,
++            request.times,
++        )
++        .await
++        .map_err(map_service_error)?;
++    Ok(AdminResponse::new(
++        StatusCode::OK,
++        AdminEnvelope::ok(Data::from(schedule)),
++    ))
++}
+diff --git a/backend/crates/gateway-core/src/provider_ports/account_warmup.rs b/backend/crates/gateway-core/src/provider_ports/account_warmup.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c38c4bbcf564bfaca145d02c446b3a478ad4b93
+--- /dev/null
++++ b/backend/crates/gateway-core/src/provider_ports/account_warmup.rs
+@@ -0,0 +1,52 @@
++//! 账号单独的预激活排期，没有排期的账号跟随全局时间表
++
++use super::valid_warmup_schedule_time;
++
++const MAX_ACCOUNT_WARMUP_TIMES: usize = 8;
++
++/// 账号自身的每日预激活时刻，按时间升序且不重复；空列表表示该账号不参与预激活
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AccountWarmupSchedule {
++    times: Vec<String>,
++}
++
++impl AccountWarmupSchedule {
++    /// 管理写入与持久化读取共用的时刻约束
++    pub fn try_new(mut times: Vec<String>) -> Result<Self, &'static str> {
++        if times
++            .iter()
++            .any(|time| time.len() != 5 || !valid_warmup_schedule_time(time))
++        {
++            return Err("预激活时间格式应为 HH:MM");
++        }
++        times.sort_unstable();
++        times.dedup();
++        if times.len() > MAX_ACCOUNT_WARMUP_TIMES {
++            return Err("单个账号最多设置 8 个预激活时间");
++        }
++        Ok(Self { times })
++    }
++
++    /// 解析持久化的逗号列表，空字符串表示不参与预激活
++    pub fn from_stored(value: &str) -> Result<Self, &'static str> {
++        if value.is_empty() {
++            return Self::try_new(Vec::new());
++        }
++        Self::try_new(value.split(',').map(str::to_owned).collect())
++    }
++
++    #[must_use]
++    pub fn to_stored(&self) -> String {
++        self.times.join(",")
++    }
++
++    #[must_use]
++    pub fn times(&self) -> &[String] {
++        &self.times
++    }
++
++    #[must_use]
++    pub fn is_due(&self, hour: u32, minute: u32) -> bool {
++        self.times.contains(&format!("{hour:02}:{minute:02}"))
++    }
++}
+diff --git a/backend/crates/gateway-core/src/provider_ports/mod.rs b/backend/crates/gateway-core/src/provider_ports/mod.rs
+index 0a73a7867d006511b2690fa9b0f15f619f7f91df..0052aba63f8aeb5a0a228f6ec595d9525b1c13a8 100644
+--- a/backend/crates/gateway-core/src/provider_ports/mod.rs
++++ b/backend/crates/gateway-core/src/provider_ports/mod.rs
+@@ -27,6 +27,8 @@ pub use cooldown::{
+ };
+ mod refresh;
+ pub use refresh::{ProviderRefreshPolicy, provider_refresh_backoff_at, provider_refresh_retry_at};
++mod account_warmup;
++pub use account_warmup::AccountWarmupSchedule;
+ mod runtime_policy;
+ pub use runtime_policy::{
+     ProviderFreezePolicy, ProviderRuntimePolicyPort, ProviderWarmupPolicy,
+diff --git a/backend/crates/gateway-core/src/provider_ports/runtime_policy.rs b/backend/crates/gateway-core/src/provider_ports/runtime_policy.rs
+index f4d8255e5ee199aac7f75569ac62a7b8bd630d43..3e0abfcbb4410cb26f20e028e4775328f00df961 100644
+--- a/backend/crates/gateway-core/src/provider_ports/runtime_policy.rs
++++ b/backend/crates/gateway-core/src/provider_ports/runtime_policy.rs
+@@ -58,6 +58,19 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
+     ) -> BoxFuture<'_, Result<ProviderWarmupPolicy, ProviderStoreError>> {
+         Box::pin(async move { Ok(ProviderWarmupPolicy::disabled()) })
+     }
++
++    /// 读取账号单独的预激活排期；默认没有排期，全部账号跟随全局时间表
++    fn load_account_warmup_schedules(
++        &self,
++    ) -> BoxFuture<
++        '_,
++        Result<
++            std::collections::BTreeMap<String, super::AccountWarmupSchedule>,
++            ProviderStoreError,
++        >,
++    > {
++        Box::pin(async move { Ok(std::collections::BTreeMap::new()) })
++    }
+ }
+ 
+ /// 账号容量熔断（自动冻结）策略；来源于 `runtime_settings`，
+diff --git a/backend/crates/gateway-core/tests/provider_ports/account_warmup.rs b/backend/crates/gateway-core/tests/provider_ports/account_warmup.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..30c435ba1ca71bf6156ea7ccb48f7b9f2ab4f35a
+--- /dev/null
++++ b/backend/crates/gateway-core/tests/provider_ports/account_warmup.rs
+@@ -0,0 +1,35 @@
++//! 验证账号预激活排期的时刻约束与持久化格式
++
++use gateway_core::provider_ports::AccountWarmupSchedule;
++
++fn times(values: &[&str]) -> Vec<String> {
++    values.iter().map(|value| (*value).to_owned()).collect()
++}
++
++#[test]
++fn account_warmup_schedule_sorts_and_deduplicates_times() {
++    let schedule = AccountWarmupSchedule::try_new(times(&["11:02", "06:00", "11:02"])).unwrap();
++
++    assert_eq!(schedule.times(), ["06:00", "11:02"]);
++    assert_eq!(schedule.to_stored(), "06:00,11:02");
++    assert!(schedule.is_due(6, 0));
++    assert!(!schedule.is_due(6, 1));
++}
++
++#[test]
++fn account_warmup_schedule_rejects_invalid_times() {
++    for value in ["8:00", "24:00", "08:00,09:00", ""] {
++        assert!(AccountWarmupSchedule::try_new(times(&[value])).is_err());
++    }
++    let too_many = (0..9).map(|hour| format!("{hour:02}:00")).collect();
++    assert!(AccountWarmupSchedule::try_new(too_many).is_err());
++}
++
++#[test]
++fn account_warmup_schedule_stores_empty_as_disabled() {
++    let disabled = AccountWarmupSchedule::from_stored("").unwrap();
++
++    assert!(disabled.times().is_empty());
++    assert_eq!(disabled.to_stored(), "");
++    assert!(AccountWarmupSchedule::from_stored("06:00,").is_err());
++}
+diff --git a/backend/crates/gateway-core/tests/provider_ports/mod.rs b/backend/crates/gateway-core/tests/provider_ports/mod.rs
+index 054c3cb3c6279e4d831a9dbcf1636f08c9814d9e..da8251ded009701df56cfa2a5786ffbf2fb5ce82 100644
+--- a/backend/crates/gateway-core/tests/provider_ports/mod.rs
++++ b/backend/crates/gateway-core/tests/provider_ports/mod.rs
+@@ -1,5 +1,7 @@
+ //! 验证 Provider 协调端口的敏感值保护、有效期与刷新边界
+ 
++mod account_warmup;
++
+ use std::collections::{BTreeMap, BTreeSet};
+ use std::num::NonZeroU32;
+ use std::time::{Duration, SystemTime};
+diff --git a/backend/crates/gateway-store/src/bundle.rs b/backend/crates/gateway-store/src/bundle.rs
+index 8a0fe00a1623be2921c99baf39588145e65fcfd5..e5cb62718afdee4c9edd066034333c38c068a30b 100644
+--- a/backend/crates/gateway-store/src/bundle.rs
++++ b/backend/crates/gateway-store/src/bundle.rs
+@@ -121,7 +121,9 @@ async fn connect(
+     let pool = if read_only {
+         postgres::connect_read_only(&database_url, config.pool).await?
+     } else {
+-        postgres::connect_and_migrate(&database_url, config.pool).await?
++        let pool = postgres::connect_and_migrate(&database_url, config.pool).await?;
++        postgres::ensure_account_warmup_schema(&pool).await?;
++        pool
+     };
+     let observability_query_budget = postgres::ObservabilityQueryBudget::try_new(
+         config.pool.observability_max_connections(),
+diff --git a/backend/crates/gateway-store/src/postgres/provider_accounts/account_warmup.rs b/backend/crates/gateway-store/src/postgres/provider_accounts/account_warmup.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bed25f38c8c6ee7ec1612d60a85e511539000871
+--- /dev/null
++++ b/backend/crates/gateway-store/src/postgres/provider_accounts/account_warmup.rs
+@@ -0,0 +1,123 @@
++//! 账号预激活排期的 PostgreSQL 读写
++//!
++//! 排期表不进入冻结迁移集合：热补丁与上游迁移编号互不影响，回退官方版本时也不会因
++//! 缺少迁移文件而启动失败；官方版本不读取这张表
++
++use std::collections::BTreeMap;
++
++use gateway_admin::model::audit::MutationAuditOperation;
++use gateway_core::provider_ports::{
++    AccountWarmupSchedule, ProviderStoreError, ProviderStoreErrorKind,
++};
++
++use super::*;
++
++/// 没有记录的账号跟随全局时间表，`schedule_time` 为空表示不参与预激活
++pub async fn ensure_account_warmup_schema(pool: &PgPool) -> StoreResult<()> {
++    sqlx::query(
++        r"create table if not exists luck7x_account_warmup (
++            account_id text primary key references provider_accounts (id) on delete cascade,
++            schedule_time text not null check (
++              schedule_time ~ '^(([01][0-9]|2[0-3]):[0-5][0-9](,([01][0-9]|2[0-3]):[0-5][0-9])*)?$'
++            )
++          )",
++    )
++    .execute(pool)
++    .await
++    .map_err(|source| postgres_unavailable("ensure account warmup schema", source))?;
++    Ok(())
++}
++
++pub(in crate::postgres) async fn load_account_warmup_schedules(
++    pool: &PgPool,
++) -> Result<BTreeMap<String, AccountWarmupSchedule>, ProviderStoreError> {
++    sqlx::query_as::<_, (String, String)>(
++        "select account_id, schedule_time from luck7x_account_warmup",
++    )
++    .fetch_all(pool)
++    .await
++    .map_err(|source| crate::provider_unavailable("load account warmup schedules", source))?
++    .into_iter()
++    .map(|(account_id, stored)| {
++        let schedule = AccountWarmupSchedule::from_stored(&stored).map_err(|_| {
++            ProviderStoreError::new(
++                ProviderStoreErrorKind::InvalidData,
++                "decode account warmup schedule",
++            )
++        })?;
++        Ok((account_id, schedule))
++    })
++    .collect()
++}
++
++impl PgAdminAccountStore {
++    pub(super) async fn load_account_warmup(
++        &self,
++        account_id: &str,
++    ) -> AdminStoreResult<Option<AccountWarmupSchedule>> {
++        let stored = sqlx::query_scalar::<_, String>(
++            "select schedule_time from luck7x_account_warmup where account_id = $1",
++        )
++        .bind(account_id)
++        .fetch_optional(&self.pool)
++        .await
++        .map_err(|source| warmup_error("load account warmup schedule", source))?;
++        stored
++            .map(|stored| {
++                AccountWarmupSchedule::from_stored(&stored).map_err(|message| {
++                    AdminStoreError::new(AdminStoreErrorKind::Invalid, "account warmup", message)
++                })
++            })
++            .transpose()
++    }
++
++    pub(super) async fn store_account_warmup(
++        &self,
++        account_id: &str,
++        schedule: Option<&AccountWarmupSchedule>,
++        context: &MutationContext,
++    ) -> AdminStoreResult<()> {
++        let mut tx = self
++            .pool
++            .begin()
++            .await
++            .map_err(|source| warmup_error("begin account warmup", source))?;
++        // 配置写入统一先锁全局版本，再锁账号记录
++        let revision = bump_config_revision_in_transaction(&mut tx)
++            .await
++            .map_err(|error| admin_store_error("account warmup", error))?;
++        let write = match schedule {
++            Some(schedule) => sqlx::query(
++                "insert into luck7x_account_warmup (account_id, schedule_time) values ($1, $2)
++                 on conflict (account_id) do update set schedule_time = excluded.schedule_time",
++            )
++            .bind(account_id)
++            .bind(schedule.to_stored()),
++            None => sqlx::query("delete from luck7x_account_warmup where account_id = $1")
++                .bind(account_id),
++        };
++        write
++            .execute(&mut *tx)
++            .await
++            .map_err(|source| warmup_error("save account warmup schedule", source))?;
++        append_admin_audit_event_in_transaction(
++            &mut tx,
++            mutation_audit(
++                context,
++                MutationAuditOperation::ProviderAccountUpdate,
++                account_id,
++                vec!["account_warmup".to_owned()],
++            ),
++            revision,
++        )
++        .await
++        .map_err(|error| admin_store_error("account warmup", error))?;
++        tx.commit()
++            .await
++            .map_err(|source| warmup_error("commit account warmup", source))
++    }
++}
++
++fn warmup_error(operation: &'static str, source: sqlx::Error) -> AdminStoreError {
++    admin_store_error("account warmup", postgres_unavailable(operation, source))
++}
+diff --git a/backend/crates/gateway-store/src/postgres/provider_accounts/admin_adapter.rs b/backend/crates/gateway-store/src/postgres/provider_accounts/admin_adapter.rs
+index e9b5f39d839c97c4ee6dbf9d1b6a26034d472c1f..77e10568df2552afa51db3c87e6358040fa8cde1 100644
+--- a/backend/crates/gateway-store/src/postgres/provider_accounts/admin_adapter.rs
++++ b/backend/crates/gateway-store/src/postgres/provider_accounts/admin_adapter.rs
+@@ -225,6 +225,23 @@ impl PgAdminAccountStore {
+ 
+ #[async_trait]
+ impl AccountStore for PgAdminAccountStore {
++    async fn account_warmup_schedule(
++        &self,
++        account_id: &str,
++    ) -> AdminStoreResult<Option<gateway_core::provider_ports::AccountWarmupSchedule>> {
++        self.load_account_warmup(account_id).await
++    }
++
++    async fn save_account_warmup_schedule(
++        &self,
++        account_id: &str,
++        schedule: Option<&gateway_core::provider_ports::AccountWarmupSchedule>,
++        context: &MutationContext,
++    ) -> AdminStoreResult<()> {
++        self.store_account_warmup(account_id, schedule, context)
++            .await
++    }
++
+     async fn account_exists(&self, account_id: &str) -> AdminStoreResult<bool> {
+         sqlx::query_scalar("select exists(select 1 from provider_accounts where id = $1)")
+             .bind(account_id)
+diff --git a/backend/crates/gateway-store/src/postgres/provider_accounts/mod.rs b/backend/crates/gateway-store/src/postgres/provider_accounts/mod.rs
+index 4903657513a47fe9684612aafe12aff83e898b92..bf78d1aa3e6db29a83cb224c0471a1281ce74fad 100644
+--- a/backend/crates/gateway-store/src/postgres/provider_accounts/mod.rs
++++ b/backend/crates/gateway-store/src/postgres/provider_accounts/mod.rs
+@@ -53,6 +53,9 @@ use super::{
+     append_admin_audit_event_in_transaction, bump_config_revision_in_transaction,
+ };
+ 
++mod account_warmup;
++pub use account_warmup::ensure_account_warmup_schema;
++pub(super) use account_warmup::load_account_warmup_schedules;
+ mod admin_adapter;
+ mod admin_queries;
+ mod authorization;
+diff --git a/backend/crates/gateway-store/src/postgres/runtime_settings.rs b/backend/crates/gateway-store/src/postgres/runtime_settings.rs
+index 1d44ecaefa86c1bc13f4b34d85f6009bd1bf877e..614be357e9d6561a88ef6a596b5adf38764ab17f 100644
+--- a/backend/crates/gateway-store/src/postgres/runtime_settings.rs
++++ b/backend/crates/gateway-store/src/postgres/runtime_settings.rs
+@@ -174,6 +174,20 @@ pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResul
+ }
+ 
+ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
++    fn load_account_warmup_schedules(
++        &self,
++    ) -> futures::future::BoxFuture<
++        '_,
++        Result<
++            BTreeMap<String, gateway_core::provider_ports::AccountWarmupSchedule>,
++            ProviderStoreError,
++        >,
++    > {
++        Box::pin(super::provider_accounts::load_account_warmup_schedules(
++            &self.pool,
++        ))
++    }
++
+     fn claim_warmup_slot<'a>(
+         &'a self,
+         timezone: gateway_core::time::DeploymentTimeZone,
+diff --git a/backend/crates/gateway-store/tests/postgres/provider_accounts/account_warmup.rs b/backend/crates/gateway-store/tests/postgres/provider_accounts/account_warmup.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc711480461afcc1a943e31800860f7c8c43ccf1
+--- /dev/null
++++ b/backend/crates/gateway-store/tests/postgres/provider_accounts/account_warmup.rs
+@@ -0,0 +1,69 @@
++//! 验证账号预激活排期的持久化、审计与账号生命周期
++
++use gateway_core::provider_ports::{AccountWarmupSchedule, ProviderRuntimePolicyPort as _};
++use gateway_store::postgres::{PgRuntimeSettingsRepository, ensure_account_warmup_schema};
++
++use super::*;
++
++#[tokio::test]
++async fn account_warmup_schedule_round_trips_audits_and_follows_account_deletion() {
++    let Some(database) = TestDatabase::create("account_warmup").await else {
++        return;
++    };
++    ensure_account_warmup_schema(&database.pool).await.unwrap();
++    ensure_account_warmup_schema(&database.pool).await.unwrap();
++    let repository = PgProviderAccountRepository::new(database.pool.clone());
++    repository
++        .insert_provider_account(account("acct_warmup", "user-warmup"))
++        .await
++        .unwrap();
++    let store = admin_account_store(&database.pool);
++    let policy = PgRuntimeSettingsRepository::new(database.pool.clone());
++    let context = MutationContext {
++        actor: MutationActor::System,
++        request_id: "account-warmup-test".into(),
++    };
++    let schedule = AccountWarmupSchedule::try_new(vec!["11:02".into(), "06:00".into()]).unwrap();
++    let disabled = AccountWarmupSchedule::try_new(Vec::new()).unwrap();
++    let before = current_revision(&database.pool).await;
++
++    let loaded = store.account_warmup_schedule("acct_warmup").await.unwrap();
++    assert_eq!(loaded, None);
++    for saved in [&schedule, &disabled, &schedule] {
++        store
++            .save_account_warmup_schedule("acct_warmup", Some(saved), &context)
++            .await
++            .unwrap();
++        let loaded = store.account_warmup_schedule("acct_warmup").await.unwrap();
++        assert_eq!(loaded.as_ref(), Some(saved));
++    }
++    let schedules = policy.load_account_warmup_schedules().await.unwrap();
++    assert_eq!(schedules.get("acct_warmup"), Some(&schedule));
++    assert!(current_revision(&database.pool).await > before);
++    let audited: i64 = sqlx::query_scalar(
++        "select count(*) from admin_audit_events where entity_ref = 'acct_warmup'",
++    )
++    .fetch_one(&database.pool)
++    .await
++    .unwrap();
++    assert_eq!(audited, 3);
++
++    store
++        .save_account_warmup_schedule("acct_warmup", None, &context)
++        .await
++        .unwrap();
++    let loaded = store.account_warmup_schedule("acct_warmup").await.unwrap();
++    assert_eq!(loaded, None);
++
++    store
++        .save_account_warmup_schedule("acct_warmup", Some(&schedule), &context)
++        .await
++        .unwrap();
++    sqlx::query("delete from provider_accounts where id = 'acct_warmup'")
++        .execute(&database.pool)
++        .await
++        .unwrap();
++    let schedules = policy.load_account_warmup_schedules().await.unwrap();
++    assert!(schedules.is_empty());
++    database.close().await;
++}
+diff --git a/backend/crates/gateway-store/tests/postgres/provider_accounts/mod.rs b/backend/crates/gateway-store/tests/postgres/provider_accounts/mod.rs
+index 2c5b2969019a0bb469c794d460369f8c2cd7c0c0..9b91b7e239414b18de7f406962839dceb9515863 100644
+--- a/backend/crates/gateway-store/tests/postgres/provider_accounts/mod.rs
++++ b/backend/crates/gateway-store/tests/postgres/provider_accounts/mod.rs
+@@ -6,6 +6,7 @@ use std::{
+     time::{Duration, SystemTime},
+ };
+ 
++mod account_warmup;
+ mod admin_adapter;
+ mod authorization;
+ mod deletion;

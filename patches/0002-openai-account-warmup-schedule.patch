@@ -1,89 +1,17 @@
-Subject: openai: schedule warmup per account and detect unstarted 5h windows
-
-- 账号备注 `预激活=HH:MM[,HH:MM]` 单独设置预激活时刻，`预激活=关闭` 不参与，未声明的账号跟随全局时间表
-- 0 用量且重置时间等于观测时刻加完整窗口的 5h 占位不再按活跃窗口跳过
-
-Base: v3.29.7
+OpenAI：按账号排期预激活；修正把未开始的 5h 窗口当成活跃窗口而跳过的问题
 
 diff --git a/backend/crates/providers/openai/src/credential/quota/warmup.rs b/backend/crates/providers/openai/src/credential/quota/warmup.rs
-index 2a5583df858db5f6225b897dbc3a01568683c8d8..a9e8dc448c21770ff94016b2c5c5bccc179c474c 100644
+index 2a5583df858db5f6225b897dbc3a01568683c8d8..62a4716fcce58043f9fca91a122283cbad11876c 100644
 --- a/backend/crates/providers/openai/src/credential/quota/warmup.rs
 +++ b/backend/crates/providers/openai/src/credential/quota/warmup.rs
-@@ -1,7 +1,98 @@
+@@ -1,7 +1,31 @@
 -//! 账号额度窗口预热与完成事件校验
-+//! 账号额度窗口预热、单号预热时刻与完成事件校验
++//! 账号额度窗口预热、未开始窗口识别与完成事件校验
  
  use super::*;
  
-+/// 账号备注中的单号预热标记键，如 `预激活=07:30,12:30`
-+const ACCOUNT_WARMUP_NOTE_KEYS: [&str; 2] = ["预激活", "warmup"];
-+/// 标记值以这些词开头时该账号不参与预热
-+const ACCOUNT_WARMUP_NOTE_OFF: [&str; 2] = ["关闭", "off"];
 +/// 本地观测时间与上游按秒取整的重置时间之间允许的偏差
 +const NOT_STARTED_WINDOW_TOLERANCE: Duration = Duration::from_secs(120);
-+
-+/// 账号预热时刻的来源
-+#[derive(Debug, PartialEq, Eq)]
-+enum AccountWarmupSchedule {
-+    /// 备注未声明，跟随全局时间表
-+    Global,
-+    /// 备注声明不参与预热
-+    Disabled,
-+    /// 只在备注列出的本地时刻预热
-+    Times(Vec<(u32, u32)>),
-+    /// 备注标记格式无效，跟随全局时间表并告警
-+    Invalid,
-+}
-+
-+/// 备注沿用全局时间表的 `HH:MM` 逗号列表格式
-+/// 标记前后可以有其他备注，值遇到时间字符以外的内容即结束
-+fn account_warmup_schedule(notes: Option<&str>) -> AccountWarmupSchedule {
-+    let Some(notes) = notes else {
-+        return AccountWarmupSchedule::Global;
-+    };
-+    // 只折叠 ASCII 大小写，字节偏移与原文一致
-+    let lowered = notes.to_ascii_lowercase();
-+    for key in ACCOUNT_WARMUP_NOTE_KEYS {
-+        for (index, _) in lowered.match_indices(key) {
-+            let Some(value) = lowered[index + key.len()..]
-+                .trim_start()
-+                .strip_prefix(['=', '＝'])
-+            else {
-+                continue;
-+            };
-+            return parse_account_warmup_value(value.trim_start());
-+        }
-+    }
-+    AccountWarmupSchedule::Global
-+}
-+
-+fn parse_account_warmup_value(value: &str) -> AccountWarmupSchedule {
-+    if ACCOUNT_WARMUP_NOTE_OFF
-+        .iter()
-+        .any(|off| value.starts_with(off))
-+    {
-+        return AccountWarmupSchedule::Disabled;
-+    }
-+    let times = value
-+        .chars()
-+        .take_while(|c| c.is_ascii_digit() || matches!(*c, ':' | ',' | '，' | ' ' | '\t'))
-+        .filter_map(|c| match c {
-+            ' ' | '\t' => None,
-+            '，' => Some(','),
-+            c => Some(c),
-+        })
-+        .collect::<String>();
-+    let times = times.trim_end_matches(',');
-+    if !gateway_core::provider_ports::valid_warmup_schedule_time(times) {
-+        return AccountWarmupSchedule::Invalid;
-+    }
-+    AccountWarmupSchedule::Times(
-+        times
-+            .split(',')
-+            .filter_map(|part| Some((part[..2].parse().ok()?, part[3..].parse().ok()?)))
-+            .collect(),
-+    )
-+}
 +
 +/// 上游对尚未开始计时的窗口返回 0 用量，重置时间为观测时刻加完整窗口时长
 +/// 该占位不代表窗口已开始，不能按活跃窗口跳过
@@ -109,7 +37,7 @@ index 2a5583df858db5f6225b897dbc3a01568683c8d8..a9e8dc448c21770ff94016b2c5c5bccc
  #[derive(Clone, Copy, PartialEq, Eq)]
  enum WarmupTerminal {
      Missing,
-@@ -71,20 +162,52 @@ async fn consume_warmup_sse(
+@@ -71,11 +95,22 @@ async fn consume_warmup_sse(
  }
  
  impl CodexCredentialQuotaService {
@@ -117,7 +45,7 @@ index 2a5583df858db5f6225b897dbc3a01568683c8d8..a9e8dc448c21770ff94016b2c5c5bccc
 -    pub async fn execute_warmup(
 +    /// 选出本地时刻 `hour:minute` 应预热的 OAuth 账号
 +    ///
-+    /// 备注声明单号时刻的账号只按自身时刻执行，其余账号在 `global_due` 时跟随全局时间表
++    /// 有单独排期的账号只按自身时刻执行，其余账号在 `global_due` 时跟随全局时间表
 +    pub async fn warmup_due_accounts(
          &self,
 -        model: &str,
@@ -126,35 +54,23 @@ index 2a5583df858db5f6225b897dbc3a01568683c8d8..a9e8dc448c21770ff94016b2c5c5bccc
 +        minute: u32,
 +        global_due: bool,
 +    ) -> Result<Vec<ProviderAccount>, CodexCredentialQuotaError> {
++        let schedules = self
++            .runtime_policy()
++            .load_account_warmup_schedules()
++            .await
++            .map_err(|error| CodexCredentialQuotaError::Store {
++                detail: error.to_string(),
++            })?;
          let mut accounts = self.repository.list_for_provider().await?;
          accounts.retain(|account| {
--            account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
-+            let eligible = account.authentication_kind()
-+                == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
-                 && account.enabled()
-                 && matches!(
+             account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+@@ -84,7 +119,19 @@ impl CodexCredentialQuotaService {
                      account.credential_state(),
                      CredentialState::Unknown | CredentialState::Ready
--                )
-+                );
-+            if !eligible {
-+                return false;
-+            }
-+            match account_warmup_schedule(account.notes()) {
-+                AccountWarmupSchedule::Global => global_due,
-+                AccountWarmupSchedule::Disabled => false,
-+                AccountWarmupSchedule::Times(times) => times.contains(&(hour, minute)),
-+                AccountWarmupSchedule::Invalid => {
-+                    // 只在全局时刻告警，避免每个检查周期重复输出
-+                    if global_due {
-+                        tracing::warn!(
-+                            account_id = %account.id(),
-+                            "OpenAI account warmup note is invalid, following the global schedule"
-+                        );
-+                    }
-+                    global_due
-+                }
-+            }
+                 )
++                && schedules
++                    .get(account.id().as_str())
++                    .map_or(global_due, |schedule| schedule.is_due(hour, minute))
          });
 +        Ok(accounts)
 +    }
@@ -168,7 +84,7 @@ index 2a5583df858db5f6225b897dbc3a01568683c8d8..a9e8dc448c21770ff94016b2c5c5bccc
          let mut summary = CodexWarmupSummary::default();
          if accounts.is_empty() {
              return Ok(summary);
-@@ -123,6 +246,7 @@ impl CodexCredentialQuotaService {
+@@ -123,6 +170,7 @@ impl CodexCredentialQuotaService {
                  // 2. 5h 窗口当前活跃且距重置时间 > 30 分钟跳过
                  let has_active_5h = snapshot.windows().iter().any(|w| {
                      w.kind() == CodexQuotaWindowKind::ShortTerm
@@ -177,7 +93,7 @@ index 2a5583df858db5f6225b897dbc3a01568683c8d8..a9e8dc448c21770ff94016b2c5c5bccc
                              reset_at > now_utc + chrono::Duration::minutes(30)
                          })
 diff --git a/backend/crates/providers/openai/src/provider/workers.rs b/backend/crates/providers/openai/src/provider/workers.rs
-index 99cc94850043d60bf3fc4bf8cf1c3c80875f260c..20105f0c47cbdf5e11a95d0cbb88727ed7ff4402 100644
+index 99cc94850043d60bf3fc4bf8cf1c3c80875f260c..cebe9226f0266c661f2b2ce24a8de58a357ada1e 100644
 --- a/backend/crates/providers/openai/src/provider/workers.rs
 +++ b/backend/crates/providers/openai/src/provider/workers.rs
 @@ -398,11 +398,19 @@ impl ScheduledTask for OpenAiWarmupTask {
@@ -191,7 +107,7 @@ index 99cc94850043d60bf3fc4bf8cf1c3c80875f260c..20105f0c47cbdf5e11a95d0cbb88727e
                  .iter()
                  .any(|&(h, m)| h == hour && m == minute);
 -            if !matched {
-+            // 账号备注可声明单号时刻，非全局时刻也要检查是否有账号到点
++            // 账号可设置单独时刻，非全局时刻也要检查是否有账号到点
 +            let accounts = self
 +                .quota
 +                .warmup_due_accounts(hour, minute, global_due)
@@ -224,19 +140,47 @@ index 99cc94850043d60bf3fc4bf8cf1c3c80875f260c..20105f0c47cbdf5e11a95d0cbb88727e
              match outcome {
                  Ok(summary) => {
 diff --git a/backend/crates/providers/openai/tests/credential/quota/warmup.rs b/backend/crates/providers/openai/tests/credential/quota/warmup.rs
-index c1c3aa3bcd1fc5796e912a0b09b165974db6ad4c..218242ace39cbd3d47e905f630ae4142c74cc198 100644
+index c1c3aa3bcd1fc5796e912a0b09b165974db6ad4c..a42b671774454ad635f47301e1c4c39075b33678 100644
 --- a/backend/crates/providers/openai/tests/credential/quota/warmup.rs
 +++ b/backend/crates/providers/openai/tests/credential/quota/warmup.rs
-@@ -1,7 +1,62 @@
+@@ -1,7 +1,90 @@
 -//! 验证额度预热按 SSE 终态判定结果、请求档位并跳过过期凭据
-+//! 验证额度预热按 SSE 终态判定结果、请求档位、单号时刻与窗口占位，并跳过过期凭据
++//! 验证额度预热按 SSE 终态判定结果、请求档位、单号排期与窗口占位，并跳过过期凭据
 +
 +use std::time::UNIX_EPOCH;
 +
++use std::{collections::BTreeMap, num::NonZeroU32};
++
++use futures::future::BoxFuture;
 +use gateway_core::account::{OpaqueProviderData, QuotaObservation};
++use gateway_core::provider_ports::{
++    AccountWarmupSchedule, ProviderRefreshPolicy, ProviderRuntimePolicyPort, ProviderStoreError,
++};
  
  use super::*;
  
++struct ScheduledRuntimePolicy(BTreeMap<String, AccountWarmupSchedule>);
++
++impl ProviderRuntimePolicyPort for ScheduledRuntimePolicy {
++    fn load_refresh_policy(
++        &self,
++    ) -> BoxFuture<'_, Result<ProviderRefreshPolicy, ProviderStoreError>> {
++        Box::pin(async {
++            ProviderRefreshPolicy::try_new(
++                Duration::from_secs(60 * 60),
++                NonZeroU32::new(2).expect("positive concurrency"),
++            )
++        })
++    }
++
++    fn load_account_warmup_schedules(
++        &self,
++    ) -> BoxFuture<'_, Result<BTreeMap<String, AccountWarmupSchedule>, ProviderStoreError>> {
++        let schedules = self.0.clone();
++        Box::pin(async move { Ok(schedules) })
++    }
++}
++
 +async fn due_account_ids(
 +    service: &CodexCredentialQuotaService,
 +    hour: u32,
@@ -291,7 +235,7 @@ index c1c3aa3bcd1fc5796e912a0b09b165974db6ad4c..218242ace39cbd3d47e905f630ae4142
  #[tokio::test]
  async fn warmup_consumes_completed_sse_and_persists_rate_limit_event() {
      let server = MockServer::start().await;
-@@ -29,7 +84,14 @@ async fn warmup_consumes_completed_sse_and_persists_rate_limit_event() {
+@@ -29,7 +112,14 @@ async fn warmup_consumes_completed_sse_and_persists_rate_limit_event() {
          server.uri(),
      );
  
@@ -307,7 +251,7 @@ index c1c3aa3bcd1fc5796e912a0b09b165974db6ad4c..218242ace39cbd3d47e905f630ae4142
  
      assert_eq!(summary.warmed_up, 1);
      assert_eq!(summary.failed, 0);
-@@ -65,7 +127,14 @@ async fn warmup_sends_the_lowest_reasoning_effort_supported_by_the_catalog() {
+@@ -65,7 +155,14 @@ async fn warmup_sends_the_lowest_reasoning_effort_supported_by_the_catalog() {
          server.uri(),
      );
  
@@ -323,7 +267,7 @@ index c1c3aa3bcd1fc5796e912a0b09b165974db6ad4c..218242ace39cbd3d47e905f630ae4142
  
      assert_eq!(summary.warmed_up, 1);
      let requests = server.received_requests().await.expect("recorded requests");
-@@ -108,7 +177,14 @@ async fn warmup_rejects_failed_sse_despite_successful_http_headers() {
+@@ -108,7 +205,14 @@ async fn warmup_rejects_failed_sse_despite_successful_http_headers() {
          server.uri(),
      );
  
@@ -339,7 +283,7 @@ index c1c3aa3bcd1fc5796e912a0b09b165974db6ad4c..218242ace39cbd3d47e905f630ae4142
  
      assert_eq!(summary.warmed_up, 0);
      assert_eq!(summary.failed, 1);
-@@ -137,8 +213,100 @@ async fn warmup_skips_expired_credential() {
+@@ -137,8 +241,110 @@ async fn warmup_skips_expired_credential() {
          server.uri(),
      );
  
@@ -358,34 +302,44 @@ index c1c3aa3bcd1fc5796e912a0b09b165974db6ad4c..218242ace39cbd3d47e905f630ae4142
  }
 +
 +#[tokio::test]
-+async fn warmup_due_accounts_follow_account_note_schedule() {
++async fn warmup_due_accounts_follow_account_schedule() {
 +    let store = Arc::new(MemoryAccountStore::default());
-+    for id in [
-+        "acct_note_global",
-+        "acct_note_invalid",
-+        "acct_note_off",
-+        "acct_note_own",
-+    ] {
++    for id in ["acct_global", "acct_off", "acct_own"] {
 +        create_account(&store, id).await;
 +    }
-+    store.set_notes("acct_note_own", "主力号 预激活 = 07:30， 12:30；其他备注");
-+    store.set_notes("acct_note_off", "WARMUP=Off");
-+    store.set_notes("acct_note_invalid", "预激活=7:30");
-+    let service = quota_service(&store);
-+
-+    // 单号时刻不依赖全局时间表，未声明与格式无效的账号只跟随全局时刻
-+    assert_eq!(
-+        due_account_ids(&service, 7, 30, false).await,
-+        ["acct_note_own"]
++    // 备注只是文字，不参与预热排期
++    store.set_notes("acct_global", "预激活=关闭");
++    let schedules = BTreeMap::from([
++        (
++            "acct_own".to_owned(),
++            AccountWarmupSchedule::try_new(vec!["07:30".to_owned(), "12:30".to_owned()])
++                .expect("valid schedule"),
++        ),
++        (
++            "acct_off".to_owned(),
++            AccountWarmupSchedule::try_new(Vec::new()).expect("empty schedule"),
++        ),
++    ]);
++    let service = CodexCredentialQuotaService::new(
++        store.repository(),
++        wire_profile(),
++        reqwest::Client::builder()
++            .no_proxy()
++            .build()
++            .expect("client"),
++        OFFICIAL_CODEX_BASE_URL.to_owned(),
++        Arc::new(crate::support::MemoryCooldownPort::new()),
++        Arc::new(crate::support::TestLeaseCoordinator::default()),
++        Arc::new(ScheduledRuntimePolicy(schedules)),
 +    );
++
++    // 单号排期不依赖全局时间表，没有排期的账号只跟随全局时刻
++    assert_eq!(due_account_ids(&service, 7, 30, false).await, ["acct_own"]);
 +    assert_eq!(
 +        due_account_ids(&service, 12, 30, true).await,
-+        ["acct_note_global", "acct_note_invalid", "acct_note_own"]
++        ["acct_global", "acct_own"]
 +    );
-+    assert_eq!(
-+        due_account_ids(&service, 8, 0, true).await,
-+        ["acct_note_global", "acct_note_invalid"]
-+    );
++    assert_eq!(due_account_ids(&service, 8, 0, true).await, ["acct_global"]);
 +    assert!(due_account_ids(&service, 8, 0, false).await.is_empty());
 +}
 +

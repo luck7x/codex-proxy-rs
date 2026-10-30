@@ -12,26 +12,28 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `0001-openai-account-warmup-schedule.patch` | 账号预激活按账号单独定时；修正把未开始的 5h 窗口当成活跃窗口而跳过的问题 |
+| `0001-account-warmup-storage-api.patch` | 账号预激活排期的独立表、管理接口 `/api/admin/accounts/warmup` 与审计 |
+| `0002-openai-account-warmup-schedule.patch` | 预激活按账号排期；修正把未开始的 5h 窗口当成活跃窗口而跳过的问题 |
+| `0003-account-warmup-ui.patch` | 账号额度面板的预激活设置 |
 
 `patches/BASE` 记录补丁当前基于的上游版本，补丁冲突时用于 3-way 合并。
 
 ### 账号预激活用法
 
-总开关和预激活模型仍在管理端「设置 → 账号预激活」。每个账号的时间写在账号备注里：
+总开关、预激活模型和全局时间仍在管理端「设置 → 账号预激活」。每个账号在账号列表展开后的额度面板里设置：
 
-| 备注写法 | 效果 |
+| 方式 | 效果 |
 | --- | --- |
-| `预激活=07:30` | 只在每天 07:30 预激活该账号 |
-| `预激活=07:30,07:35` | 多个时间用逗号分隔；后一个可作为失败补发，成功时只多发一次小请求，不会重启窗口 |
-| `预激活=关闭` | 该账号不参与预激活 |
-| 不写 | 跟随设置页的全局时间，一起批量预激活 |
+| 跟随全局 | 按设置页的执行时间预激活 |
+| 自定义 | 只在列出的时间预激活，每个账号最多 8 个 |
+| 关闭 | 该账号不参与预激活 |
 
-- 标记可以和其他备注写在一起，例如 `主力号 预激活=07:30；其他说明`，时间之后用分号、换行或文字隔开
-- 也可以写成 `warmup=07:30`、`warmup=off`，中文逗号和等号也能识别
-- 格式写错时该账号按全局时间执行，并在日志里告警
+- 需要失败补发时多加一个时间，例如 `06:00`、`06:05`；第一次成功时后一次只多发一个小请求，不会重启窗口
 - 时间按部署时区（`host.timezone`）计算
 - 仍会跳过周额度已用完的账号，以及 5h 窗口正在计时且距重置超过 30 分钟的账号
+- 账号备注不参与预激活
+
+排期存在 `luck7x_account_warmup` 表：没有记录的账号跟随全局，`schedule_time` 为空表示关闭。这张表由程序启动时自动创建，不进入上游迁移集合，所以不占上游的迁移编号；随业务备份一起备份，回退官方版本时留在库里不起作用。
 
 上游对还没开始的 5h 窗口会返回「用量 0、重置时间 = 观测时刻 + 5 小时」的占位数据，原版会把它当作正在计时而跳过。
 补丁识别这种占位（与观测时刻的偏差在 2 分钟内），照常预激活。
@@ -53,8 +55,8 @@ gh run list -R luck7x/codex-proxy-rs --workflow native-build.yml --limit 3
 工作流步骤：
 
 1. `prepare`：校验输入，拉取上游 tag 并应用补丁，从上游的 `rust-toolchain.toml` 和 `deploy/Dockerfile` 读取工具链版本
-2. `checks`：`cargo fmt --check`、`provider-openai` 的 clippy 和额度相关测试
-3. `frontend`、`backend`：编译管理端前端和后端程序，后端使用与上游发行相同的 Rust 镜像
+2. `checks`：`cargo fmt --check`、补丁涉及 crate 的 clippy 和相关测试，存储测试使用工作流启动的 PostgreSQL 与 Redis
+3. `frontend`、`backend`：检查并编译管理端前端，编译后端程序，后端使用与上游发行相同的 Rust 镜像
 4. `package`：检查通过后打包为 `codex-proxy-rs-native-<版本>` 产物，保留 30 天
 
 ## 部署
@@ -104,14 +106,24 @@ sudo systemctl restart codex-proxy-rs
 ```bash
 git clone https://github.com/zyycn/codex-proxy-rs.git cpr-upstream && cd cpr-upstream
 git checkout -b adapt <新 tag>
-git apply --3way /path/to/hotpatch/patches/0001-openai-account-warmup-schedule.patch
-# 按冲突标记修改文件，完成后
-git add -A
-git diff --cached --full-index <新 tag> -- backend > /path/to/hotpatch/patches/0001-openai-account-warmup-schedule.patch
+# 依次处理三个补丁，每个补丁打上并解决冲突后提交一次，记下提交哈希
+git apply --3way /path/to/hotpatch/patches/0001-account-warmup-storage-api.patch
+git add -A && git commit -m "adapt 0001"  # 记为 $A
+git apply --3way /path/to/hotpatch/patches/0002-openai-account-warmup-schedule.patch
+git add -A && git commit -m "adapt 0002"  # 记为 $B
+git apply --3way /path/to/hotpatch/patches/0003-account-warmup-ui.patch
+git add -A && git commit -m "adapt 0003"  # 记为 $C
+
+# 从这三个提交重新生成补丁
+git diff --full-index "$A^" "$A" > /path/to/hotpatch/patches/0001-account-warmup-storage-api.patch
+git diff --full-index "$B^" "$B" > /path/to/hotpatch/patches/0002-openai-account-warmup-schedule.patch
+git diff --full-index "$C^" "$C" > /path/to/hotpatch/patches/0003-account-warmup-ui.patch
 ```
 
 把补丁文件开头的说明行补回去（`git apply` 会忽略第一个 `diff --git` 之前的文字），提交到本分支，再运行 Native Build。
 编译和测试是否通过以 Actions 结果为准。
+
+冲突最可能出现在 `warmup.rs`、`workers.rs` 和账号路由；排期表、管理接口和前端组件都是独立的新文件，上游改动很难碰到。
 
 ## 新增补丁
 
@@ -130,5 +142,5 @@ git diff --cached --full-index <新 tag> -- backend > /path/to/hotpatch/patches/
 | 分支 | 用途 |
 | --- | --- |
 | `hotpatch` | 默认分支，即本分支：补丁、工作流、脚本和文档 |
-| `luck7x/v3.29.7-account-warmup` | 补丁在 v3.29.7 上的完整源码，供查看和比对 |
+| `luck7x/account-warmup-settings` | 补丁在 v3.29.7 上的完整源码，供查看和比对，每个补丁一个提交 |
 | `main` | 早期的 3.16 定制版本，已不再使用 |

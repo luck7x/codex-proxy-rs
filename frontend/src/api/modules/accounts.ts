@@ -734,6 +734,28 @@ export function getAccountDetail(data: AccountIdParam, options: RequestOptions =
   })
 }
 
+export interface AccountWarmup {
+  times: string[] | null
+}
+
+export function getAccountWarmup(data: AccountIdParam, options: RequestOptions = {}) {
+  return request<AccountWarmup>({
+    url: '/api/admin/accounts/warmup',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function setAccountWarmup(data: AccountIdParam & AccountWarmup, options: RequestOptions = {}) {
+  return request<AccountWarmup>({
+    url: '/api/admin/accounts/warmup',
+    method: 'POST',
+    data,
+    ...options,
+  })
+}
+
 export interface AccountResetCreditAutomation {
   enabled: boolean
   leadMinutes: number

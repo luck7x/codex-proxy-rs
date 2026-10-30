@@ -21,7 +21,7 @@ const model = defineModel<string>('model', { required: true })
 
       <ZFormItem
         label="执行时间"
-        description="HH:MM；多个时间用英文逗号分隔"
+        description="HH:MM；多个时间用英文逗号分隔；账号可在额度面板单独设置"
       >
         <ZInput
           v-model="scheduleTime"

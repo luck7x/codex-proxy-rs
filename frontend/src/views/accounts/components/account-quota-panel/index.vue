@@ -8,8 +8,10 @@ import { computed, shallowRef, watch } from 'vue'
 import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
 import { formatProviderLabel } from '@/utils/providers'
 import { groupedAccountQuotaWindows, orderedPanelQuotaWindows } from '../../constants'
+import { isOpenAiOAuthAccount } from '../../utils/upstreamApiKey'
 import AccountProfileModal from '../account-profile-modal/index.vue'
 import AccountQuotaForecastModal from '../account-quota-forecast-modal/index.vue'
+import AccountWarmupSettings from './AccountWarmupSettings.vue'
 import AccountQuotaPanelEntry from './Entry.vue'
 import AccountResetCredits from './ResetCredits.vue'
 
@@ -113,6 +115,7 @@ watch(hasPersonalInfo, (available) => {
         额度待观测
       </p>
     </div>
+    <AccountWarmupSettings v-if="isOpenAiOAuthAccount(account)" :account-id="account.id" class="mt-3" />
   </section>
 
   <AccountProfileModal

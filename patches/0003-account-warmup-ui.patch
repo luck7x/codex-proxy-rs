@@ -35,7 +35,7 @@ index 89fb72ee64e02a3fa5c809bf92efa687efaf453f..dbb8b516b5bb0d739e77d347a79bfffc
    leadMinutes: number
 diff --git a/frontend/src/views/accounts/components/account-quota-panel/AccountWarmupSettings.vue b/frontend/src/views/accounts/components/account-quota-panel/AccountWarmupSettings.vue
 new file mode 100644
-index 0000000000000000000000000000000000000000..9dee8878831a0d98b9eed9119749713468d0187a
+index 0000000000000000000000000000000000000000..7e0064cc600593efe8cb9e902f58be141a0477e1
 --- /dev/null
 +++ b/frontend/src/views/accounts/components/account-quota-panel/AccountWarmupSettings.vue
 @@ -0,0 +1,129 @@
@@ -48,10 +48,10 @@ index 0000000000000000000000000000000000000000..9dee8878831a0d98b9eed91197497134
 +
 +type WarmupMode = 'global' | 'custom' | 'disabled'
 +
++const props = defineProps<{ accountId: string }>()
++
 +const MAX_TIMES = 8
 +const modeOptions = [{ label: '跟随全局', value: 'global' }, { label: '自定义', value: 'custom' }, { label: '关闭', value: 'disabled' }]
-+
-+const props = defineProps<{ accountId: string }>()
 +const mode = shallowRef<WarmupMode>('global')
 +const times = shallowRef<string[]>([])
 +const newTime = shallowRef('')
